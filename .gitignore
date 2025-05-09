@@ -172,3 +172,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+an4/*
+lightning_logs/
+*.tar.gz
+data/
+outputs/
