@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python 디버거: ASR Training",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/asr_train.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--data_config_name", "for_experiments",
+                "--data_train_split", "dev.clean",
+                "--data_val_split", "test.clean",
+                "--data_test_split", "test.other",
+                "--batch_size", "1",
+            ]
+        }
+    ]
+}
