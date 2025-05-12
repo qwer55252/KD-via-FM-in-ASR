@@ -21,6 +21,8 @@ from copy import deepcopy
 from nemo.utils.app_state import AppState
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 import glob
+import torch
+import torch.nn.functional as F
 
 def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
     """
@@ -151,6 +153,51 @@ def make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_
     
     return student_cfg
 
+class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
+    def __init__(self, cfg, trainer, teacher_model, kd_alpha, kd_temperature):
+        super().__init__(cfg=cfg, trainer=trainer)
+        self.teacher = teacher_model
+        self.kd_alpha = kd_alpha
+        self.temperature = kd_temperature
+
+    def training_step(self, batch, batch_idx):
+        # 1) base class와 동일하게 입력 unpack
+        #    (signal, signal_length, transcript, transcript_length)
+        signal, signal_length, transcript, transcript_length = batch
+
+        # 2) student forward
+        log_probs, encoded_len, _ = self.forward(
+            input_signal=signal, input_signal_length=signal_length
+        )
+        # 3) CTC loss 계산
+        ctc_loss = self.loss(
+            log_probs=log_probs,
+            targets=transcript,
+            input_lengths=encoded_len,
+            target_lengths=transcript_length,
+        )
+        # 4) teacher forward (no grad) → softmax logits
+        with torch.no_grad():
+            tch_log_probs, tch_encoded_len, _ = self.teacher.forward(
+                input_signal=signal, input_signal_length=signal_length
+            )
+        T = self.temperature
+        stu_logp = F.log_softmax(log_probs / T, dim=-1)
+        tch_p    = F.softmax(tch_log_probs  / T, dim=-1)
+        kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T * T)
+
+        # 5) 합성 loss
+        loss = ctc_loss + self.kd_alpha * kd_loss
+
+        # 6) logging (PyTorch Lightning 방식)
+        self.log("train_loss",     loss,     prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train_ctc_loss", ctc_loss, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("train_kd_loss",  kd_loss,  prog_bar=False, on_step=True, on_epoch=True)
+
+        return loss
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train halved-dimension Conformer CTC student on LibriSpeech 100h"
@@ -207,6 +254,24 @@ def main():
         type=bool,
         default=False,
         help="True: teacher 모델 학습, False: student 모델 학습",
+    )
+    parser.add_argument(
+        "--logit_distillation",
+        type=bool,
+        default=False,
+        help="CTC loss 외에 teacher logits 와의 KL-divergence loss 를 추가"
+    )
+    parser.add_argument(
+        "--kd_alpha",
+        type=float,
+        default=1.0,
+        help="logit distillation loss 의 가중치"
+    )
+    parser.add_argument(
+        "--kd_temperature",
+        type=float,
+        default=1.0,
+        help="softmax 온도 파라미터"
     )
     args = parser.parse_args()
 
@@ -301,15 +366,27 @@ def main():
     teacher_model._save_restore_connector.model_extracted_dir = "/workspace/outputs/nemo_archive"
     AppState().nemo_file_folder = "/workspace/outputs/nemo_archive"
 
+    if args.train_teacher_model:
+        student_cfg = make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
+    else:
+        student_cfg = make_student_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
     
-    student_cfg = make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_manifest) if args.train_teacher_model else make_student_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
-    
+    print(f'student_cfg: {student_cfg}')
     
     # 7) student 모델 생성 (가중치는 랜덤 초기화)
-    student_model = nemo_asr.models.EncDecCTCModelBPE(
-        cfg=student_cfg,
-        trainer=trainer,
-    )
+    if args.logit_distillation:
+        student_model = DistilEncDecCTCModelBPE(
+            cfg=student_cfg,
+            trainer=trainer,
+            teacher_model=teacher_model,
+            kd_alpha=args.kd_alpha,
+            kd_temperature=args.kd_temperature,
+        )
+    else:
+        student_model = nemo_asr.models.EncDecCTCModelBPE(
+            cfg=student_cfg,
+            trainer=trainer,
+        )
 
 
     # 9) 학습 시작
