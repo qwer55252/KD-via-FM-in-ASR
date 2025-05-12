@@ -155,9 +155,10 @@ def make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_
     return student_cfg
 
 class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
-    def __init__(self, cfg, trainer, teacher_model, kd_alpha=0.1, kd_temperature=1.0, layerwise_distillation=False, layer_kd_alpha=1.0):
+    def __init__(self, cfg, trainer, teacher_model, logit_distillation=True, kd_alpha=0.1, kd_temperature=1.0, layerwise_distillation=False, layer_kd_alpha=1.0):
         super().__init__(cfg=cfg, trainer=trainer)
         self.teacher = teacher_model
+        self.logit_distillation = logit_distillation
         self.kd_alpha = kd_alpha
         self.temperature = kd_temperature
         self.layerwise_distillation = layerwise_distillation
@@ -179,22 +180,23 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             input_lengths=encoded_len,
             target_lengths=transcript_length,
         )
-        # 4) teacher forward (no grad) → softmax logits
-        with torch.no_grad():
-            tch_log_probs, tch_encoded_len, _ = self.teacher.forward(
-                input_signal=signal, input_signal_length=signal_length
-            )
-        T = self.temperature
-        stu_logp = F.log_softmax(log_probs / T, dim=-1)
-        tch_p    = F.softmax(tch_log_probs  / T, dim=-1)
-        kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T * T)
+        
+        # logit distillation loss
+        if self.logit_distillation:
+            with torch.no_grad():
+                tch_log_probs, _, _ = self.teacher.forward(...)
+            T = self.temperature
+            stu_logp = F.log_softmax(log_probs / T, dim=-1)
+            tch_p    = F.softmax(tch_log_probs  / T, dim=-1)
+            kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T*T)
+            self.log("train_kd_loss", kd_loss, prog_bar=False, on_step=True, on_epoch=True)
+        else:
+            kd_loss = torch.tensor(0.0, device=log_probs.device)
 
         # layerwise distillation loss
         layer_loss = torch.tensor(0.0, device=log_probs.device)
         if self.layerwise_distillation:
-            # student encoder features
             stu_feat, _ = self.encoder(input_signal=signal, input_signal_length=signal_length)
-            # teacher encoder features
             with torch.no_grad():
                 tch_feat, _ = self.teacher.encoder(input_signal=signal, input_signal_length=signal_length)
             # teacher feature 차원 맞추기
@@ -203,12 +205,14 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.log("train_layer_kd_loss", layer_loss, prog_bar=False, on_step=True, on_epoch=True)
 
         # 종합 loss
-        loss = ctc_loss + self.kd_alpha * kd_loss + self.layer_kd_alpha * layer_loss
+        loss = ctc_loss \
+             + (self.kd_alpha * kd_loss if self.logit_distillation else 0.0) \
+             + (self.layer_kd_alpha * layer_loss if self.layerwise_distillation else 0.0)
+
 
         # logging
         self.log("train_loss",     loss,     prog_bar=True, on_step=True, on_epoch=True)
         self.log("train_ctc_loss", ctc_loss, prog_bar=False, on_step=True, on_epoch=True)
-        self.log("train_kd_loss",  kd_loss,  prog_bar=False, on_step=True, on_epoch=True)
         return loss
 
 
@@ -407,27 +411,31 @@ def main():
 
     if args.train_teacher_model:
         model_cfg = make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
+        is_student = False
     else:
         model_cfg = make_student_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
+        is_student = True
     
     print(f'model_cfg: {model_cfg}')
     
     # 7) student 모델 생성 (가중치는 랜덤 초기화)
-    if args.train_teacher_model:
-        model = nemo_asr.models.EncDecCTCModelBPE(
-            cfg=model_cfg,
-            trainer=trainer,
-        )
+    if is_student:
+        model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
     else:
-        model = DistilEncDecCTCModelBPE(
-            cfg=model_cfg,
-            trainer=trainer,
-            teacher_model=teacher_model,
-            kd_alpha=args.kd_alpha,
-            kd_temperature=args.kd_temperature,
-            layerwise_distillation=args.layerwise_distillation,
-            layer_kd_alpha=args.layer_kd_alpha,
-        )
+        if args.logit_distillation or args.layerwise_distillation:
+            model = DistilEncDecCTCModelBPE(
+                cfg=model_cfg,
+                trainer=trainer,
+                teacher_model=teacher_model,
+                logit_distillation=args.logit_distillation,
+                kd_alpha=args.kd_alpha,
+                kd_temperature=args.kd_temperature,
+                layerwise_distillation=args.layerwise_distillation,
+                layer_kd_alpha=args.layer_kd_alpha,
+            )
+        else:
+            model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
+
 
 
     # 8) 학습 시작
