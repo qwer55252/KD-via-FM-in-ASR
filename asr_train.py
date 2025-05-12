@@ -14,6 +14,7 @@ from ruamel.yaml import YAML
 import nemo.collections.asr as nemo_asr
 import lightning as pl
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 from datasets import load_dataset, DownloadConfig, config
 import aiohttp
 from omegaconf import OmegaConf
@@ -154,11 +155,13 @@ def make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_
     return student_cfg
 
 class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
-    def __init__(self, cfg, trainer, teacher_model, kd_alpha, kd_temperature):
+    def __init__(self, cfg, trainer, teacher_model, kd_alpha=0.1, kd_temperature=1.0, layerwise_distillation=False, layer_kd_alpha=1.0):
         super().__init__(cfg=cfg, trainer=trainer)
         self.teacher = teacher_model
         self.kd_alpha = kd_alpha
         self.temperature = kd_temperature
+        self.layerwise_distillation = layerwise_distillation
+        self.layer_kd_alpha = layer_kd_alpha
 
     def training_step(self, batch, batch_idx):
         # 1) base class와 동일하게 입력 unpack
@@ -186,14 +189,26 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         tch_p    = F.softmax(tch_log_probs  / T, dim=-1)
         kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T * T)
 
-        # 5) 합성 loss
-        loss = ctc_loss + self.kd_alpha * kd_loss
+        # layerwise distillation loss
+        layer_loss = torch.tensor(0.0, device=log_probs.device)
+        if self.layerwise_distillation:
+            # student encoder features
+            stu_feat, _ = self.encoder(input_signal=signal, input_signal_length=signal_length)
+            # teacher encoder features
+            with torch.no_grad():
+                tch_feat, _ = self.teacher.encoder(input_signal=signal, input_signal_length=signal_length)
+            # teacher feature 차원 맞추기
+            tch_feat_slice = tch_feat[..., :stu_feat.size(-1)]
+            layer_loss = F.mse_loss(stu_feat, tch_feat_slice)
+            self.log("train_layer_kd_loss", layer_loss, prog_bar=False, on_step=True, on_epoch=True)
 
-        # 6) logging (PyTorch Lightning 방식)
+        # 종합 loss
+        loss = ctc_loss + self.kd_alpha * kd_loss + self.layer_kd_alpha * layer_loss
+
+        # logging
         self.log("train_loss",     loss,     prog_bar=True, on_step=True, on_epoch=True)
         self.log("train_ctc_loss", ctc_loss, prog_bar=False, on_step=True, on_epoch=True)
         self.log("train_kd_loss",  kd_loss,  prog_bar=False, on_step=True, on_epoch=True)
-
         return loss
 
 
@@ -273,14 +288,29 @@ def main():
         default=1.0,
         help="softmax 온도 파라미터"
     )
+    parser.add_argument(
+        "--layerwise_distillation", 
+        type=bool, 
+        default=False,
+        help="레이어 단위 KD 실행 여부"
+    )
+    parser.add_argument(
+        "--layer_kd_alpha", 
+        type=float, 
+        default=1.0,
+        help="레이어 KD loss 가중치"
+    )
     args = parser.parse_args()
 
     # manifest 경로 설정
+    os.makedirs(args.output_dir, exist_ok=True)
+    manifest_dir = os.path.join(args.data_dir, "manifests")
+    os.makedirs(manifest_dir, exist_ok=True)
     # train_manifest = os.path.join(args.data_dir, "manifests", "train-clean-100.json")
     # val_manifest = os.path.join(args.data_dir, "manifests", "validation.json")
-    train_manifest = os.path.join(args.data_dir, "manifests", "train.json")
-    val_manifest = os.path.join(args.data_dir, "manifests", "val.json")
-    test_manifest = os.path.join(args.data_dir, "manifests", "test.json")
+    train_manifest = os.path.join(manifest_dir, "train.json")
+    val_manifest = os.path.join(manifest_dir, "val.json")
+    test_manifest = os.path.join(manifest_dir, "test.json")
 
     # 1) HuggingFace LibriSpeech 로드
     print("Datasets cache dir:", config.HF_DATASETS_CACHE)
@@ -342,6 +372,14 @@ def main():
     # 3) W&B logger 생성
     exp_name = os.getenv("EXP_NAME")
     wandb_logger = WandbLogger(project=exp_name, save_dir=args.output_dir)
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.output_dir,
+        filename="best",
+        save_top_k=1,
+        verbose=True,
+        monitor="val_loss",
+        mode="min",
+    )
 
     # 4) PyTorch Lightning Trainer
     trainer = pl.Trainer(
@@ -350,6 +388,7 @@ def main():
         max_epochs=args.epochs,
         default_root_dir=args.output_dir,
         logger=wandb_logger,
+        callbacks=[checkpoint_callback],
     )
 
     # 5) Teacher 모델 로드 (pretrained) -> config만 사용할 것
@@ -367,39 +406,47 @@ def main():
     AppState().nemo_file_folder = "/workspace/outputs/nemo_archive"
 
     if args.train_teacher_model:
-        student_cfg = make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
+        model_cfg = make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
     else:
-        student_cfg = make_student_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
+        model_cfg = make_student_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
     
-    print(f'student_cfg: {student_cfg}')
+    print(f'model_cfg: {model_cfg}')
     
     # 7) student 모델 생성 (가중치는 랜덤 초기화)
-    if args.logit_distillation:
-        student_model = DistilEncDecCTCModelBPE(
-            cfg=student_cfg,
+    if args.train_teacher_model:
+        model = nemo_asr.models.EncDecCTCModelBPE(
+            cfg=model_cfg,
+            trainer=trainer,
+        )
+    else:
+        model = DistilEncDecCTCModelBPE(
+            cfg=model_cfg,
             trainer=trainer,
             teacher_model=teacher_model,
             kd_alpha=args.kd_alpha,
             kd_temperature=args.kd_temperature,
-        )
-    else:
-        student_model = nemo_asr.models.EncDecCTCModelBPE(
-            cfg=student_cfg,
-            trainer=trainer,
+            layerwise_distillation=args.layerwise_distillation,
+            layer_kd_alpha=args.layer_kd_alpha,
         )
 
 
-    # 9) 학습 시작
-    trainer.fit(student_model)
-    student_model.save_to(f"outputs/{exp_name}/result_weight_{exp_name}.nemo")
-
+    # 8) 학습 시작
+    trainer.fit(model)
+    
+    # 9) Best checkpoint 로드 후 .nemo로 저장
+    best_ckpt = checkpoint_callback.best_model_path
+    if best_ckpt:
+        model = model.load_from_checkpoint(best_ckpt, trainer=trainer)
+    os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
+    model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
+    print(f"Saved .nemo to {args.output_dir}/{exp_name}")
 
     # 10) 평가 시작
     split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
     for split_name in split_names:
         print(f"\n===== Evaluating on split: {split_name} =====")
-        student_model.eval()
-        
+        model.eval()
+
         test_i_ds = load_dataset(
             args.data_script_path,
             args.data_config_name,
@@ -408,23 +455,20 @@ def main():
             download_config=dl_cfg,
             cache_dir=cache_dir,
         )
-        
-        json_name = split_name.replace(".", "_") + ".json"   # ex: dev_clean.json
-        manifest_i = os.path.join(args.data_dir, "manifests", json_name)
+        json_name = split_name.replace(".", "_") + ".json"
+        manifest_i = os.path.join(manifest_dir, json_name)
         build_manifest_from_hf(test_i_ds, manifest_i, cache_dir)
 
-        student_model.cfg.test_ds.manifest_filepath = manifest_i
-        
-        dl = student_model.test_dataloader()
-
+        model.cfg.test_ds.manifest_filepath = manifest_i
+        dl = model.test_dataloader()
         results = trainer.test(
-            model=student_model,
+            model=model,
             dataloaders=[dl],
-            ckpt_path="best",
+            ckpt_path=best_ckpt or None,
             verbose=True,
         )
         for res in results:
-            wer = res.get("test_wer", res.get("wer", None))
+            wer  = res.get("test_wer", res.get("wer", None))
             loss = res.get("test_loss", None)
             print(f"  → split={split_name} | loss={loss:.4f} | wer={wer:.2%}")
 
