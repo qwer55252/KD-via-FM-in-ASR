@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # 실험할 layer_kd_alpha 값들 (파일명 suffix)
-alphas=(0 001 01 1 2 5)
+alphas=(001 01 1 2 5)
 
 for alpha in "${alphas[@]}"; do
   script="scripts/train/layerkd_layeralpha${alpha}.sh"
