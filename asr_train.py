@@ -10,6 +10,7 @@ Weights & Biases 로깅 포함
 import os
 import json
 import argparse
+import torch.nn as nn
 from ruamel.yaml import YAML
 import nemo.collections.asr as nemo_asr
 import lightning as pl
@@ -163,6 +164,18 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.temperature = kd_temperature
         self.layerwise_distillation = layerwise_distillation
         self.layer_kd_alpha = layer_kd_alpha
+        
+        # projection 레이어를 lazy 초기화하기 위한 placeholder
+        self.layer_proj = None
+        
+    def _init_layer_proj(self, stu_feat: torch.Tensor, tch_feat: torch.Tensor):
+        """
+        stu_feat: (B, H_s, T_s), tch_feat: (B, H_t, T_t)
+        """
+        H_s = stu_feat.size(1)
+        H_t = tch_feat.size(1)
+        # student→teacher projection
+        self.layer_proj = nn.Linear(H_s, H_t).to(stu_feat.device)
 
     def training_step(self, batch, batch_idx):
         # 1) base class와 동일하게 입력 unpack
@@ -208,7 +221,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             stu_feat, _ = self.encoder(
                 audio_signal=proc_signal,
                 length=proc_length,
-            )
+            ) # torch.Size([32, 88, 405])
             with torch.no_grad():
                 # teacher도 동일하게 preprocessor → encoder
                 proc_signal_t, proc_length_t = self.teacher.preprocessor(
@@ -218,10 +231,20 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 tch_feat, _ = self.teacher.encoder(
                     audio_signal=proc_signal_t,
                     length=proc_length_t,
-                )
-            # teacher feature 차원 맞추기 (batch, time_t, hidden_t) → (batch, time_s, hidden_s)
-            tch_feat_slice = tch_feat[:, :stu_feat.size(1), :stu_feat.size(2)] # 
-            layer_loss = F.mse_loss(stu_feat, tch_feat_slice)
+                ) # torch.Size([32, 176, 405])
+            
+            # teacher feature 차원 맞추기 (batch, hidden_t, time_t) → (batch, hidden_s, time_s)
+            if self.layer_proj is None:
+                self._init_layer_proj(stu_feat, tch_feat)
+            B, H_s, T_s = stu_feat.size()               # (B, H_s, T_s) torch.Size([32, 88, 405])
+            stu_feat = stu_feat.transpose(1, 2)         # (B, T_s, H_s) torch.Size([32, 405, 88])
+            stu_flat = stu_feat.reshape(-1, H_s)        # (B*T_s, H_s)  torch.Size([12960, 88])
+            proj_flat = self.layer_proj(stu_flat)       # (B*T_s, H_t)  torch.Size([12960, 176])
+            stu_proj = proj_flat.reshape(B, T_s, -1)    # (B, T_s, H_t) torch.Size([32, 405, 176])
+            stu_proj = stu_proj.transpose(1, 2)         # (B, H_t, T_s) torch.Size([32, 176, 405])
+
+            # layer_loss = F.mse_loss(stu_aligned, tch_feat)
+            layer_loss = F.mse_loss(stu_proj, tch_feat)
             self.log("train_layer_kd_loss", layer_loss, prog_bar=False, on_step=True, on_epoch=True)
         else:
             layer_loss = torch.tensor(0.0, device=log_probs.device)
