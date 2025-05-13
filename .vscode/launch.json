@@ -1,19 +1,33 @@
+// .vscode/launch.json
 {
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Python 디버거: ASR Training",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/asr_train.py",
-            "console": "integratedTerminal",
-            "args": [
-                "--data_config_name", "for_experiments",
-                "--data_train_split", "dev.clean",
-                "--data_val_split", "test.clean",
-                "--data_test_split", "test.other",
-                "--batch_size", "1",
-            ]
-        }
-    ]
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Train Distil CTC with Layer KD",
+      "type": "debugpy",
+      "request": "launch",
+
+      "program": "${workspaceFolder}/asr_train.py",
+      "console": "integratedTerminal",
+      // cwd도 마찬가지로 이 launch.json 파일이 있는 폴더로
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "HF_DATASETS_CACHE": "/root/.cache/huggingface/datasets"
+      },
+      "args": [
+        "--output_dir", "${workspaceFolder}/outputs/LayerKD_CTCLoss/layeralpha01",
+        "--data_config_name", "train_100",
+        "--data_train_split", "train.clean.100",
+        "--data_val_split", "dev.clean",
+        "--data_test_split", "test.clean",
+        "--batch_size", "32",
+        "--epochs", "1",
+        "--logit_distillation", "True",
+        "--kd_temperature", "1",
+        "--kd_alpha", "0.1",
+        "--layerwise_distillation", "True",
+        "--layer_kd_alpha", "0.1"
+      ]
+    }
+  ]
 }
