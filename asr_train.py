@@ -184,7 +184,10 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # logit distillation loss
         if self.logit_distillation:
             with torch.no_grad():
-                tch_log_probs, _, _ = self.teacher.forward(...)
+                tch_log_probs, tch_encoded_len, tch_logits = self.teacher.forward(
+                    input_signal=signal,
+                    input_signal_length=signal_length,
+                )
             T = self.temperature
             stu_logp = F.log_softmax(log_probs / T, dim=-1)
             tch_p    = F.softmax(tch_log_probs  / T, dim=-1)
@@ -196,13 +199,32 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # layerwise distillation loss
         layer_loss = torch.tensor(0.0, device=log_probs.device)
         if self.layerwise_distillation:
-            stu_feat, _ = self.encoder(input_signal=signal, input_signal_length=signal_length)
+            # 1) raw waveform → feature
+            proc_signal, proc_length = self.preprocessor(
+                input_signal=signal,
+                length=signal_length,
+            )
+            # 2) feature → encoder output (batch, feat_dim, time) 형태
+            stu_feat, _ = self.encoder(
+                audio_signal=proc_signal,
+                length=proc_length,
+            )
             with torch.no_grad():
-                tch_feat, _ = self.teacher.encoder(input_signal=signal, input_signal_length=signal_length)
-            # teacher feature 차원 맞추기
-            tch_feat_slice = tch_feat[..., :stu_feat.size(-1)]
+                # teacher도 동일하게 preprocessor → encoder
+                proc_signal_t, proc_length_t = self.teacher.preprocessor(
+                    input_signal=signal,
+                    length=signal_length,
+                )
+                tch_feat, _ = self.teacher.encoder(
+                    audio_signal=proc_signal_t,
+                    length=proc_length_t,
+                )
+            # teacher feature 차원 맞추기 (batch, time_t, hidden_t) → (batch, time_s, hidden_s)
+            tch_feat_slice = tch_feat[:, :stu_feat.size(1), :stu_feat.size(2)] # 
             layer_loss = F.mse_loss(stu_feat, tch_feat_slice)
             self.log("train_layer_kd_loss", layer_loss, prog_bar=False, on_step=True, on_epoch=True)
+        else:
+            layer_loss = torch.tensor(0.0, device=log_probs.device)
 
         # 종합 loss
         loss = ctc_loss \
@@ -418,11 +440,13 @@ def main():
     
     print(f'model_cfg: {model_cfg}')
     
-    # 7) student 모델 생성 (가중치는 랜덤 초기화)
-    if is_student:
+    # 7) 모델 생성 (가중치는 랜덤 초기화)
+    if not is_student:
+        print(f'단순 teacher 모델을 불러옵니다.')
         model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
     else:
         if args.logit_distillation or args.layerwise_distillation:
+            print(f'distillation 모델을 불러옵니다.')
             model = DistilEncDecCTCModelBPE(
                 cfg=model_cfg,
                 trainer=trainer,
@@ -434,8 +458,8 @@ def main():
                 layer_kd_alpha=args.layer_kd_alpha,
             )
         else:
+            print(f'단순 student 모델을 불러옵니다.')
             model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
-
 
 
     # 8) 학습 시작
@@ -443,8 +467,6 @@ def main():
     
     # 9) Best checkpoint 로드 후 .nemo로 저장
     best_ckpt = checkpoint_callback.best_model_path
-    if best_ckpt:
-        model = model.load_from_checkpoint(best_ckpt, trainer=trainer)
     os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
     model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
     print(f"Saved .nemo to {args.output_dir}/{exp_name}")
@@ -475,10 +497,22 @@ def main():
             ckpt_path=best_ckpt or None,
             verbose=True,
         )
-        for res in results:
-            wer  = res.get("test_wer", res.get("wer", None))
-            loss = res.get("test_loss", None)
-            print(f"  → split={split_name} | loss={loss:.4f} | wer={wer:.2%}")
+        
+        # trainer.test 는 리스트(dict) 반환, 첫 번째 원소에서 메트릭 추출
+        res   = results[0]
+        wer   = res.get("test_wer", res.get("wer", None))
+        loss  = res.get("test_loss", res.get("loss", None))
+        print(f"  → split={split_name} | loss={loss:.4f} | wer={wer:.2%}")
+        
+        # ① 메트릭 키에 split 이름을 붙여서 Wandb에 기록
+        # #    dev.clean  → dev_clean/wer, dev_clean/loss
+        key_prefix = split_name.replace(".", "_")
+        metrics = {
+            f"{key_prefix}/wer":  wer,
+            f"{key_prefix}/loss": loss,
+        }
+        # ② step을 epoch 기반으로 찍거나 global_step 을 사용
+        wandb_logger.log_metrics(metrics, step=trainer.current_epoch)
 
     
     
