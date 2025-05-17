@@ -260,8 +260,6 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("train_ctc_loss", ctc_loss, prog_bar=False, on_step=True, on_epoch=True)
         return loss
 
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Train halved-dimension Conformer CTC student on LibriSpeech 100h"
@@ -496,7 +494,8 @@ def main():
 
     # 10) 평가 시작
     split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
-    for split_name in split_names:
+    metrics = {}
+    for i, split_name in enumerate(split_names):
         print(f"\n===== Evaluating on split: {split_name} =====")
         model.eval()
 
@@ -512,8 +511,17 @@ def main():
         manifest_i = os.path.join(manifest_dir, json_name)
         build_manifest_from_hf(test_i_ds, manifest_i, cache_dir)
 
-        model.cfg.test_ds.manifest_filepath = manifest_i
+        test_data_config = deepcopy(model.cfg.test_ds)
+        test_data_config.manifest_filepath = manifest_i
+        # shuffle 옵션이 없으면 False 로 자동 설정되지만, 명시적으로 꺼줄 수도 있습니다.
+        test_data_config.shuffle = False
+
+        # NeMo API 호출: 내부에서 _test_dl 이 세팅되고,
+        # 이후 test_dataloader() 호출 시 이 _test_dl 이 반환됩니다.
+        model.setup_test_data(test_data_config)
         dl = model.test_dataloader()
+        
+        
         results = trainer.test(
             model=model,
             dataloaders=[dl],
@@ -530,16 +538,16 @@ def main():
         # ① 메트릭 키에 split 이름을 붙여서 Wandb에 기록
         # #    dev.clean  → dev_clean/wer, dev_clean/loss
         key_prefix = split_name.replace(".", "_")
-        metrics = {
+        metric = {
             f"{key_prefix}/wer":  wer,
             f"{key_prefix}/loss": loss,
         }
+        metrics[f"{key_prefix}/wer"] = wer
+        metrics[f"{key_prefix}/loss"] = loss
         # ② step을 epoch 기반으로 찍거나 global_step 을 사용
-        wandb_logger.log_metrics(metrics, step=trainer.current_epoch)
-
+        wandb_logger.log_metrics(metric, step=trainer.current_epoch)
+    print(f"metrics: {metrics}")
+    wandb_logger.log_metrics(metrics, step=trainer.current_epoch)
     
-    
-    
-
 if __name__ == "__main__":
     main()
