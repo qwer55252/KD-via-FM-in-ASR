@@ -310,6 +310,332 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("train_ctc_loss", ctc_loss, prog_bar=False, on_step=True, on_epoch=True)
         return loss
 
+class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
+    def __init__(
+        self,
+        cfg,
+        trainer,
+        teacher_model,
+        logit_distillation=True,
+        kd_alpha=0.1,
+        kd_temperature=1.0,
+        layerwise_distillation=False,
+        layer_kd_alpha=1.0,
+        use_flow_matching=False,
+        flow_cfg=None,
+    ):
+        super().__init__(cfg=cfg, trainer=trainer)
+        self.teacher = teacher_model
+        self.logit_distillation = logit_distillation
+        self.kd_alpha = kd_alpha
+        self.temperature = kd_temperature
+        self.layerwise_distillation = layerwise_distillation
+        self.layer_kd_alpha = layer_kd_alpha
+        self.use_flow_matching = use_flow_matching
+        # Lazy init for layer projection
+        self.layer_proj = None
+        # FlowMatchingModule
+        if use_flow_matching:
+            assert flow_cfg is not None
+            self.flow_matching = FlowMatchingModule(flow_cfg)
+
+    def _init_layer_proj(self, stu_feat, tch_feat):
+        H_s = stu_feat.size(1)
+        H_t = tch_feat.size(1)
+        self.layer_proj = nn.Linear(H_s, H_t).to(stu_feat.device)
+
+    def training_step(self, batch, batch_idx):
+        # unpack
+        signal, sig_len, transcript, transcript_len = batch
+        # student forward
+        log_probs, encoded_len, _ = self.forward(
+            input_signal=signal, input_signal_length=sig_len
+        )
+        # CTC loss
+        ctc_loss = self.loss(
+            log_probs=log_probs,
+            targets=transcript,
+            input_lengths=encoded_len,
+            target_lengths=transcript_len,
+        )
+        # logit K
+        kd_loss = torch.tensor(0.0, device=log_probs.device)
+        if self.logit_distillation:
+            with torch.no_grad():
+                tch_logp, tch_len, _ = self.teacher.forward(
+                    input_signal=signal,
+                    input_signal_length=sig_len,
+                )
+            stu_logp = F.log_softmax(log_probs / self.temperature, dim=-1)
+            tch_p = F.softmax(tch_logp / self.temperature, dim=-1)
+            kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (self.temperature**2)
+            self.log("train_kd_loss", kd_loss, on_step=True, on_epoch=True)
+        # layerwise KD
+        layer_loss = torch.tensor(0.0, device=log_probs.device)
+        stu_feat, tch_feat = None, None
+        if self.layerwise_distillation or self.use_flow_matching:
+            proc_sig, proc_len = self.preprocessor(
+                input_signal=signal,
+                length=sig_len,
+            )
+            stu_feat, _ = self.encoder(audio_signal=proc_sig, length=proc_len)
+            with torch.no_grad():
+                proc_t, proc_tlen = self.teacher.preprocessor(
+                    input_signal=signal,
+                    length=sig_len,
+                )
+                tch_feat, _ = self.teacher.encoder(
+                    audio_signal=proc_t,
+                    length=proc_tlen,
+                )
+            if self.layer_proj is None:
+                self._init_layer_proj(stu_feat, tch_feat)
+            # align dims
+            B, H_s, T_s = stu_feat.size()
+            stu_flat = stu_feat.transpose(1,2).reshape(-1, H_s)
+            proj_flat = self.layer_proj(stu_flat)
+            stu_proj = proj_flat.reshape(B, T_s, -1).transpose(1,2)
+            layer_loss = F.mse_loss(stu_proj, tch_feat)
+            self.log("train_layer_kd_loss", layer_loss, on_step=True, on_epoch=True)
+        # flow matching
+        flow_loss = torch.tensor(0.0, device=log_probs.device)
+        if self.use_flow_matching:
+            assert stu_feat is not None and tch_feat is not None
+            flow_loss, _ = self.flow_matching(stu_feat, tch_feat)
+            self.log("train_flow_matching_loss", flow_loss, on_step=True, on_epoch=True)
+        # total
+        loss = (
+            ctc_loss
+            + (self.kd_alpha * kd_loss if self.logit_distillation else 0.0)
+            + (self.layer_kd_alpha * layer_loss if self.layerwise_distillation else 0.0)
+            + (flow_loss if self.use_flow_matching else 0.0)
+        )
+        self.log("train_loss", loss, on_step=True, on_epoch=True)
+        return loss
+
+def rectified_flow_schedule(t):
+    alpha_t = t
+    sigma_t = 1 - t
+    return alpha_t, sigma_t
+def vp_ode_schedule(t, a=19.9, b=0.1):
+    alpha_t = torch.exp(-0.25 * a * (1 - t) ** 2 - 0.5 * b * (1 - t))
+    sigma_t = torch.sqrt(1 - alpha_t ** 2)
+    return alpha_t, sigma_t
+def ve_ode_schedule(t, a=0.02, b=100):
+    alpha_t = a * (b / a) ** t
+    sigma_t = torch.ones_like(t)
+    return alpha_t, sigma_t
+
+class MLPEncoder(nn.Module):
+    def __init__(self, in_dim, out_dim, num_layers=2):
+        super().__init__()
+        layers = []
+        if num_layers == 2:
+            layers = [
+                nn.Linear(in_dim, out_dim),
+                nn.ReLU(),
+                nn.Linear(out_dim, out_dim),
+            ]
+        elif num_layers == 1:
+            layers = [
+                nn.Linear(in_dim, out_dim),
+                nn.ReLU(),
+                nn.Linear(out_dim, out_dim),
+            ]
+        self.encoder = nn.Sequential(*layers)
+    def forward(self, x):
+        return self.encoder(x)
+class SwinTransformerEncoder(nn.Module):
+    def __init__(self, in_dim, out_dim, num_heads=4):
+        super().__init__()
+        # 간단화 버전 (실제 사용시 SwinAttention module로 교체)
+        self.attn = nn.MultiheadAttention(in_dim, num_heads)
+        self.linear1 = nn.Linear(in_dim, out_dim)
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(out_dim, out_dim)
+    def forward(self, x):
+        # x: (B, F) → (1, B, F) for MultiheadAttention
+        x_attn, _ = self.attn(x.unsqueeze(0), x.unsqueeze(0), x.unsqueeze(0))
+        x_attn = x_attn.squeeze(0)
+        x = self.linear1(x_attn)
+        x = self.relu(x)
+        x = self.linear2(x)
+        return x
+class CNNEncoder(nn.Module):
+    # for image classification
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.SiLU(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.GroupNorm(4, out_ch),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 1)
+        )
+    def forward(self, x):
+        return self.block(x)
+
+class FlowMatchingModule(nn.Module):
+    def __init__(self, flow_cfg):
+        super().__init__()
+        # 파라미터 파싱
+        self.meta_encoder_type = flow_cfg.get("meta_encoder_type", "mlp")
+        time_embed_dim = flow_cfg.get("time_embed_dim", 32)
+        hidden_dim = flow_cfg.get("hidden_dim", 128)
+        self.training_sampling = flow_cfg.get("training_sampling", 8)
+        self.inference_sampling = flow_cfg.get("inference_sampling", 8)
+        self.weight = flow_cfg.get("weight", 1.0)
+        self.feature_dim = flow_cfg.get("student_dim", 88)
+        self.teacher_dim = flow_cfg.get("teacher_dim", 176)
+
+        # time embedding
+        self.time_embed = nn.Linear(1, time_embed_dim)
+
+        # meta_encoder 자동 생성
+        if self.meta_encoder_type == "mlp":
+            self.meta_encoder = nn.Sequential(
+                nn.Linear(self.feature_dim + time_embed_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, self.feature_dim)
+            )
+        elif self.meta_encoder_type == "cnn":
+            # 예시: 1D conv
+            self.meta_encoder = nn.Sequential(
+                nn.Conv1d(self.feature_dim, self.feature_dim, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv1d(self.feature_dim, self.feature_dim, kernel_size=1)
+            )
+        elif self.meta_encoder_type == "swin":
+            self.meta_encoder = SwinTransformerEncoder(self.feature_dim + time_embed_dim, self.feature_dim)
+        else:
+            raise ValueError(f"Unknown meta_encoder type: {self.meta_encoder_type}")
+
+        # shape_transformation_function 선택
+        shape_transform = flow_cfg.get("shape_transform", "linear")
+        self.shape_transform_type = shape_transform
+        if shape_transform == "identity":
+            self.shape_transformation_function = nn.Identity()
+        elif shape_transform == "linear":
+            self.shape_transformation_function = nn.Linear(self.feature_dim, self.teacher_dim)
+        elif shape_transform == "conv1d":
+            self.shape_transformation_function = nn.Conv1d(self.feature_dim, self.teacher_dim, 1)
+        else:
+            raise ValueError(f"Unknown shape_transform type: {shape_transform}")
+
+        # loss 선택
+        loss_type = flow_cfg.get("loss", "mse")
+        if loss_type == "mse":
+            self.metric_based_loss_function = nn.MSELoss()
+        elif loss_type == "cosine":
+            self.metric_based_loss_function = nn.CosineEmbeddingLoss()
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+
+        # noise schedule
+        noise_schedule = flow_cfg.get("noise_schedule", "rectified")
+        if noise_schedule == "rectified":
+            self.noise_schedule = rectified_flow_schedule
+        elif noise_schedule == "vp_ode":
+            self.noise_schedule = vp_ode_schedule
+        elif noise_schedule == "ve_ode":
+            self.noise_schedule = ve_ode_schedule
+        else:
+            raise NotImplementedError
+
+    def forward(self, s_f, t_f=None, target=None, inference_sampling: int = None):
+        # s_f: student feature/logit, shape: (B, F, T) ex) torch.Size([32, 88, 422])
+        
+        # t_f: teacher feature/logit, shape: (B, F', T') or None - ex) torch.Size([32, 176, 422])
+        
+        all_p_t_f = []
+        sampling_steps = self.training_sampling if self.training else (inference_sampling or self.inference_sampling)
+        loss = 0.0
+        x = s_f # ex) torch.Size([32, 88, 422])
+        
+        for i in reversed(range(1, sampling_steps + 1)):
+            t = torch.full((s_f.size(0), 1), i / sampling_steps, device=s_f.device)
+            embed_t = self.time_embed(t) # torch.Size([32, 32])
+            
+            if self.meta_encoder_type == "mlp":
+                # 1) (B, feature_dim, T) → (B, T, feature_dim)
+                x_perm = x.permute(0, 2, 1)
+                # 2) (B, T, feature_dim) → (B, T, time_embed_dim)
+                t_expand = embed_t.unsqueeze(1).expand(-1, x_perm.size(1), -1)
+                # 3) concat → (B, T, feature_dim + time_embed_dim)
+                embed_x = torch.cat([x_perm, t_expand], dim=-1)
+                # ex) embed_x.shape = torch.Size([32, 411, 120])
+                # 4) MLP 적용 → (B, T, feature_dim)
+                velocity = self.meta_encoder(embed_x) 
+                # 5) 다시 (B, feature_dim, T)
+                velocity = velocity.permute(0, 2, 1)
+                # ex) velocity.shape = torch.Size([32, 88, 411])
+
+            else:
+                # cnn, swin 의 경우 기존 코드 유지
+                embed_t_expand = embed_t.unsqueeze(-1).expand(-1, -1, x.size(2))
+                embed_x = torch.cat([x, embed_t_expand], dim=1)
+                velocity = self.meta_encoder(embed_x)
+            
+            
+            x = x - velocity / sampling_steps
+            
+            
+            if self.shape_transform_type == "linear":
+                # (B, feature_dim, T) → (B, T, feature_dim)
+                x_fc = x.permute(0, 2, 1)
+                # Linear(88→176) 적용: (B, T, feature_dim) → (B, T, teacher_dim)
+                y_fc = self.shape_transformation_function(x_fc)
+                # 다시 (B, teacher_dim, T)
+                p_t_f = y_fc.permute(0, 2, 1)
+            else:
+                # conv1d, identity 등은 그대로
+                p_t_f = self.shape_transformation_function(x)
+            
+            
+            all_p_t_f.append(p_t_f)
+            if self.training and t_f is not None:
+                loss += self.metric_based_loss_function(p_t_f, t_f)
+            if self.training and target is not None:
+                loss += F.cross_entropy(p_t_f, target)
+        if self.training:
+            loss = loss * (self.weight / sampling_steps)
+            return loss, torch.stack(all_p_t_f, dim=0).mean(0)
+        else:
+            return 0.0, torch.stack(all_p_t_f, dim=0).mean(0)
+    # def forward(self, s_f, t_f=None, target=None, inference_sampling: int = 1):
+    #     all_p_t_f = []
+    #     if self.training:
+    #         if t_f is not None:
+    #             l = int(self.dirac_ratio * t_f.size(0))
+    #             perm = torch.randperm(t_f.size(0) - l, device=t_f.device)
+    #             t_f[l:] = t_f[l:][perm]
+    #         loss = 0.0
+    #         x = s_f
+    #         for i in reversed(range(1, self.training_sampling + 1)):
+    #             t = torch.full((s_f.size(0), 1), i / self.training_sampling, device=s_f.device)
+    #             embed_t = self.time_embed(t)
+    #             embed_x = x + embed_t
+    #             velocity = self.meta_encoder(embed_x)
+    #             x = x - velocity / self.training_sampling
+    #             p_t_f = self.shape_transformation_function(s_f - velocity)
+    #             all_p_t_f.append(p_t_f)
+    #             if t_f is not None:
+    #                 loss += self.metric_based_loss_function(p_t_f, t_f)
+    #             if target is not None:
+    #                 loss += F.cross_entropy(p_t_f, target)
+    #         loss = loss * (self.weight / self.training_sampling)
+    #         return loss, torch.stack(all_p_t_f, dim=0).mean(0)
+    #     else:
+    #         x = s_f
+    #         for i in reversed(range(1, inference_sampling + 1)):
+    #             t = torch.full((s_f.size(0), 1), i / inference_sampling, device=s_f.device)
+    #             embed_t = self.time_embed(t)
+    #             embed_x = x + embed_t
+    #             velocity = self.meta_encoder(embed_x)
+    #             x = x - velocity / inference_sampling
+    #             all_p_t_f.append(self.shape_transformation_function(s_f - velocity))
+    #         return 0.0, torch.stack(all_p_t_f, dim=0).mean(0)
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train halved-dimension Conformer CTC student on LibriSpeech 100h"
@@ -396,6 +722,37 @@ def main():
         type=float, 
         default=1.0,
         help="레이어 KD loss 가중치"
+    )
+    parser.add_argument(
+        "--use_flow_matching",
+        type=bool,
+        default=False,
+        help="Flow Matching 기법 사용 여부"
+    )
+    parser.add_argument(
+        "--flow_steps",
+        type=int,
+        default=8,
+        help="Flow Matching 시 사용되는 시간 단계 수"
+    )
+    parser.add_argument(
+        "--dirac_ratio",
+        type=float,
+        default=0.1,
+        help="Flow Matching 시 Dirac delta 비율 (0.0 ~ 1.0)"
+    )
+    parser.add_argument(
+        "--flow_weight",
+        type=float,
+        default=1.0,
+        help="Flow Matching loss 의 가중치"
+    )
+    parser.add_argument(
+        "--flow_schedule",
+        type=str,
+        default="rectified",
+        choices=["rectified", "vp_ode", "ve_ode"],
+        help="Flow Matching 시 사용되는 noise schedule"
     )
     args = parser.parse_args()
 
@@ -515,8 +872,38 @@ def main():
     if not is_student:
         print(f'단순 teacher 모델을 불러옵니다.')
         model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
+    
     else:
-        if args.logit_distillation or args.layerwise_distillation:
+        if args.use_flow_matching:
+            flow_cfg = {
+                    "meta_encoder_type": "mlp",   # ["mlp", "cnn", "swin"]
+                    "feature_dim": model_cfg.encoder.d_model,
+                    "time_embed_dim": 32,
+                    "hidden_dim": 128,
+                    "training_sampling": args.flow_steps,
+                    "inference_sampling": args.flow_steps,
+                    "weight": args.flow_weight,
+                    "noise_schedule": args.flow_schedule,  # "rectified", "vp_ode", "ve_ode"
+                    "loss": "mse",  # or "cosine"
+                    "shape_transform": "linear",  # or "linear", "conv1d" 등
+                    "student_dim": model_cfg.encoder.d_model,  # student 모델의 feature dim
+                    "teacher_dim": teacher_model.cfg.encoder.d_model,  # teacher 모델의 feature dim
+                    
+                    # 필요하다면 cnn일 경우 in_ch, out_ch 등 추가
+                }
+            model = DistilFlowMatchingCTCModelBPE(
+                cfg=model_cfg,
+                trainer=trainer,
+                teacher_model=teacher_model,
+                logit_distillation=args.logit_distillation,
+                kd_alpha=args.kd_alpha,
+                kd_temperature=args.kd_temperature,
+                layerwise_distillation=args.layerwise_distillation,
+                layer_kd_alpha=args.layer_kd_alpha,
+                use_flow_matching=args.use_flow_matching,
+                flow_cfg=flow_cfg,
+            )
+        elif args.logit_distillation or args.layerwise_distillation:
             print(f'distillation 모델을 불러옵니다.')
             model = DistilEncDecCTCModelBPE(
                 cfg=model_cfg,
