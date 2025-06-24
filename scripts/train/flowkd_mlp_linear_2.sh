@@ -6,7 +6,7 @@ OUTPUT_DIR="./outputs/$EXP_NAME/flowkd"
 mkdir -p "$OUTPUT_DIR"
 
 # 2) 학습 실행 및 로그 저장
-python asr_train.py \
+CUDA_VISIBLE_DEVICES=2 python asr_train.py \
 --output_dir "$OUTPUT_DIR" \
 --data_config_name train_100 \
 --data_train_split train.clean.100 \
@@ -20,6 +20,6 @@ python asr_train.py \
 --layerwise_distillation False \
 --layer_kd_alpha 1.0 \
 --use_flow_matching True \
---flow_steps 8
+--flow_steps 2
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1
