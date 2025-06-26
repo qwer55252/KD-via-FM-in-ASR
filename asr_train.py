@@ -754,6 +754,11 @@ def main():
         choices=["rectified", "vp_ode", "ve_ode"],
         help="Flow Matching 시 사용되는 noise schedule"
     )
+    parser.add_argument(
+        "--test_mode",
+        action="store_true",
+        help="테스트 모드일 때 True로 설정하면 데이터셋을 매우 적게 사용"
+    )
     args = parser.parse_args()
 
     # manifest 경로 설정
@@ -822,17 +827,43 @@ def main():
         build_manifest_from_hf(test_ds, test_manifest, cache_dir)
         print(f"test_manifest DONE: {test_manifest}")
     print("manifest files built.")
+    
+    # test_mode 데이터셋 축소
+    if args.test_mode:
+        print("Running in test mode, reducing dataset size...")
+        train_ds = train_ds.select(range(100))
+        val_ds = val_ds.select(range(100))
+        test_ds = test_ds.select(range(100))
+        # test_mode용 manifest 파일 생성
+        test_train_manifest = os.path.join(manifest_dir, "train_testmode.json")
+        test_val_manifest = os.path.join(manifest_dir, "val_testmode.json")
+        test_test_manifest = os.path.join(manifest_dir, "test_testmode.json")
+        build_manifest_from_hf(train_ds, test_train_manifest, cache_dir)
+        build_manifest_from_hf(val_ds, test_val_manifest, cache_dir)
+        build_manifest_from_hf(test_ds, test_test_manifest, cache_dir)
+        train_manifest = test_train_manifest
+        val_manifest = test_val_manifest
+        test_manifest = test_test_manifest
+        
+        # epochs 수 축소
+        args.epochs = 5
+    print(f"train_manifest: {train_manifest}")
+    print(f"val_manifest: {val_manifest}")
+    print(f"test_manifest: {test_manifest}")
+    
 
     # 3) W&B logger 생성
+    prj_name = os.getenv("PRJ_NAME")
     exp_name = os.getenv("EXP_NAME")
-    wandb_logger = WandbLogger(project=exp_name, save_dir=args.output_dir)
+    wandb_logger = WandbLogger(project=prj_name, name=exp_name, save_dir=args.output_dir)
+    last_ckpt_dir = os.path.join(args.output_dir, "checkpoints")
+    last_ckpt_path = os.path.join(last_ckpt_dir, "last.ckpt")
     checkpoint_callback = ModelCheckpoint(
-        dirpath=args.output_dir,
-        filename="best",
-        save_top_k=1,
+        dirpath=last_ckpt_dir,
+        filename="last",
+        save_top_k=0,
         verbose=True,
-        monitor="val_loss",
-        mode="min",
+        save_last=True,
     )
 
     # 4) PyTorch Lightning Trainer
@@ -922,13 +953,17 @@ def main():
 
     # 8) 학습 시작
     trainer.fit(model)
-    
+        
     # 9) Best checkpoint 로드 후 .nemo로 저장
-    best_ckpt = checkpoint_callback.best_model_path
-    os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
-    model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
-    print(f"Saved .nemo to {args.output_dir}/{exp_name}")
-
+    # last_ckpt_path = os.path.join(args.output_dir, "checkpoint", "last_ckpt.ckpt")
+    # trainer.save_checkpoint(last_ckpt_path)
+    # print(f"✅ Final checkpoint saved to {last_ckpt_path}")
+    
+    # best_ckpt = checkpoint_callback.best_model_path
+    # os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
+    # model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
+    # print(f"Saved .nemo to {args.output_dir}/{exp_name}")
+    
     # 10) 평가 시작
     split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
     metrics = {}
@@ -961,7 +996,7 @@ def main():
         results = trainer.test(
             model=model,
             dataloaders=[dl],
-            ckpt_path=best_ckpt or None,
+            ckpt_path=last_ckpt_path or None,
             verbose=True,
         )
         
