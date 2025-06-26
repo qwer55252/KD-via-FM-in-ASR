@@ -1,12 +1,13 @@
 export HF_DATASETS_CACHE="/root/.cache/huggingface/datasets"
-export EXP_NAME="FlowMatching_KD"
+export PRJ_NAME="FlowMatching_KD"
+export EXP_NAME="flowkd_mlp_linear_sampling8"
 
 # 1) 출력 디렉토리 생성
-OUTPUT_DIR="./outputs/$EXP_NAME/flowkd"
+OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
 mkdir -p "$OUTPUT_DIR"
 
 # 2) 학습 실행 및 로그 저장
-python asr_train.py \
+CUDA_VISIBLE_DEVICES=0 python asr_train.py \
 --output_dir "$OUTPUT_DIR" \
 --data_config_name train_100 \
 --data_train_split train.clean.100 \
