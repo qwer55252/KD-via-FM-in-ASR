@@ -156,13 +156,13 @@ def make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_
     return student_cfg
 
 class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
-    def __init__(self, cfg, trainer, teacher_model, logit_distillation=True, kd_alpha=0.1, kd_temperature=1.0, layerwise_distillation=False, layer_kd_alpha=1.0):
+    def __init__(self, cfg, trainer, teacher_model, use_logit_distillation=True, kd_alpha=0.1, kd_temperature=1.0, use_layerwise_distillation=False, layer_kd_alpha=1.0):
         super().__init__(cfg=cfg, trainer=trainer)
         self.teacher = teacher_model
-        self.logit_distillation = logit_distillation
+        self.use_logit_distillation = use_logit_distillation
         self.kd_alpha = kd_alpha
         self.temperature = kd_temperature
-        self.layerwise_distillation = layerwise_distillation
+        self.use_layerwise_distillation = use_layerwise_distillation
         self.layer_kd_alpha = layer_kd_alpha
         
         # projection 레이어를 lazy 초기화하기 위한 placeholder
@@ -245,7 +245,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         )
         
         # logit distillation loss
-        if self.logit_distillation:
+        if self.use_logit_distillation:
             with torch.no_grad():
                 tch_log_probs, tch_encoded_len, tch_logits = self.teacher.forward(
                     input_signal=signal,
@@ -261,7 +261,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # layerwise distillation loss
         layer_loss = torch.tensor(0.0, device=log_probs.device)
-        if self.layerwise_distillation:
+        if self.use_layerwise_distillation:
             # 1) raw waveform → feature
             proc_signal, proc_length = self.preprocessor(
                 input_signal=signal,
@@ -301,8 +301,8 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # 종합 loss
         loss = ctc_loss \
-             + (self.kd_alpha * kd_loss if self.logit_distillation else 0.0) \
-             + (self.layer_kd_alpha * layer_loss if self.layerwise_distillation else 0.0)
+             + (self.kd_alpha * kd_loss if self.use_logit_distillation else 0.0) \
+             + (self.layer_kd_alpha * layer_loss if self.use_layerwise_distillation else 0.0)
 
 
         # logging
@@ -316,20 +316,22 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         cfg,
         trainer,
         teacher_model,
-        logit_distillation=True,
+        use_ctc=True,
+        use_logit_distillation=True,
         kd_alpha=0.1,
         kd_temperature=1.0,
-        layerwise_distillation=False,
+        use_layerwise_distillation=False,
         layer_kd_alpha=1.0,
         use_flow_matching=False,
         flow_cfg=None,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
         self.teacher = teacher_model
-        self.logit_distillation = logit_distillation
+        self.use_ctc = use_ctc
+        self.use_logit_distillation = use_logit_distillation
         self.kd_alpha = kd_alpha
         self.temperature = kd_temperature
-        self.layerwise_distillation = layerwise_distillation
+        self.use_layerwise_distillation = use_layerwise_distillation
         self.layer_kd_alpha = layer_kd_alpha
         self.use_flow_matching = use_flow_matching
         # Lazy init for layer projection
@@ -344,75 +346,131 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         H_t = tch_feat.size(1)
         self.layer_proj = nn.Linear(H_s, H_t).to(stu_feat.device)
 
-    def training_step(self, batch, batch_idx):
-        # unpack
-        signal, sig_len, transcript, transcript_len = batch
-        # student forward
-        log_probs, encoded_len, _ = self.forward(
-            input_signal=signal, input_signal_length=sig_len
-        )
-        # CTC loss
-        ctc_loss = self.loss(
-            log_probs=log_probs,
-            targets=transcript,
-            input_lengths=encoded_len,
-            target_lengths=transcript_len,
-        )
-        # logit K
-        kd_loss = torch.tensor(0.0, device=log_probs.device)
-        if self.logit_distillation:
+    def forward(self, input_signal=None, input_signal_length=None, 
+                processed_signal=None, processed_signal_length=None):
+        """
+        Forward pass of the model.
+
+        Args:
+            input_signal: Tensor that represents a batch of raw audio signals,
+                of shape [B, T]. T here represents timesteps, with 1 second of audio represented as
+                `self.sample_rate` number of floating point values.
+            input_signal_length: Vector of length B, that contains the individual lengths of the audio
+                sequences.
+            processed_signal: Tensor that represents a batch of processed audio signals,
+                of shape (B, D, T) that has undergone processing via some DALI preprocessor.
+            processed_signal_length: Vector of length B, that contains the individual lengths of the
+                processed audio sequences.
+
+        Returns:
+            A tuple of 3 elements -
+            1) The log probabilities tensor of shape [B, T, D].
+            2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
+            3) The greedy token predictions of the model of shape [B, T] (via argmax)
+        """
+        # preprocess
+        has_input = input_signal is not None and input_signal_length is not None
+        has_processed = processed_signal is not None and processed_signal_length is not None
+        if (has_input ^ has_processed) is False:
+            raise ValueError("Arguments `input_signal`/`input_signal_length` and `processed_signal`/`processed_signal_length` are mutually exclusive")
+        if not has_processed:
+            processed_signal, processed_signal_length = self.preprocessor(
+                input_signal=input_signal,
+                length=input_signal_length,
+            )
+        # spec augmentation
+        if self.spec_augmentation is not None and self.training:
+            processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+        # encode
+        encoder_out, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        # encoder_out.shape : torch.Size([32, 88, 179])
+        # prepare teacher feature for training
+        tch_feat = None
+        if self.use_flow_matching and self.training:
             with torch.no_grad():
-                tch_logp, tch_len, _ = self.teacher.forward(
-                    input_signal=signal,
-                    input_signal_length=sig_len,
-                )
+                proc_t, len_t = self.teacher.preprocessor(input_signal=input_signal, length=input_signal_length)
+                tch_feat, _ = self.teacher.encoder(audio_signal=proc_t, length=len_t)
+        # flow matching (training & inference)
+        if self.use_flow_matching:
+            flow_loss, encoder_out = self.flow_matching(encoder_out, tch_feat)
+            # encoder_out.shape : torch.Size([32, 176, 179])
+        else:
+            flow_loss = torch.tensor(0.0, device=encoder_out.device)
+        # decode: positional → kwargs 수정
+        log_probs = self.decoder(encoder_output=encoder_out)
+        greedy_preds = log_probs.argmax(dim=-1, keepdim=False)
+        if self.training:
+            return log_probs, encoded_len, greedy_preds, flow_loss
+        else:
+            return log_probs, encoded_len, greedy_preds
+    
+    def training_step(self, batch, batch_idx):
+        signal, sig_len, transcript, transcript_len = batch
+        # forward with flow loss
+        log_probs, encoded_len, _, flow_loss = self.forward(input_signal=signal, input_signal_length=sig_len)
+        # CTC loss
+        if self.use_ctc:
+            ctc_loss = self.loss(
+                log_probs=log_probs,
+                targets=transcript,
+                input_lengths=encoded_len,
+                target_lengths=transcript_len,
+            )
+        else:
+            ctc_loss = torch.tensor(0.0, device=log_probs.device)
+            self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
+        
+        # logit distillation loss
+        kd_loss = torch.tensor(0.0, device=log_probs.device)
+        if self.use_logit_distillation:
+            with torch.no_grad():
+                tch_logp, _, _ = self.teacher.forward(input_signal=signal, input_signal_length=sig_len)
             stu_logp = F.log_softmax(log_probs / self.temperature, dim=-1)
             tch_p = F.softmax(tch_logp / self.temperature, dim=-1)
-            kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (self.temperature**2)
+            kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (self.temperature ** 2)
             self.log("train_kd_loss", kd_loss, on_step=True, on_epoch=True)
-        # layerwise KD
-        layer_loss = torch.tensor(0.0, device=log_probs.device)
-        stu_feat, tch_feat = None, None
-        if self.layerwise_distillation or self.use_flow_matching:
-            proc_sig, proc_len = self.preprocessor(
-                input_signal=signal,
-                length=sig_len,
-            )
+        else:
+            kd_loss = torch.tensor(0.0, device=signal.device)
+        # layerwise distillation loss
+        if self.use_layerwise_distillation:
+            proc_sig, proc_len = self.preprocessor(input_signal=signal, length=sig_len)
             stu_feat, _ = self.encoder(audio_signal=proc_sig, length=proc_len)
             with torch.no_grad():
-                proc_t, proc_tlen = self.teacher.preprocessor(
-                    input_signal=signal,
-                    length=sig_len,
-                )
-                tch_feat, _ = self.teacher.encoder(
-                    audio_signal=proc_t,
-                    length=proc_tlen,
-                )
+                proc_t, proc_tlen = self.teacher.preprocessor(input_signal=signal, length=sig_len)
+                tch_feat, _ = self.teacher.encoder(audio_signal=proc_t, length=proc_tlen)
             if self.layer_proj is None:
                 self._init_layer_proj(stu_feat, tch_feat)
-            # align dims
             B, H_s, T_s = stu_feat.size()
-            stu_flat = stu_feat.transpose(1,2).reshape(-1, H_s)
+            stu_flat = stu_feat.transpose(1, 2).reshape(-1, H_s)
             proj_flat = self.layer_proj(stu_flat)
-            stu_proj = proj_flat.reshape(B, T_s, -1).transpose(1,2)
+            stu_proj = proj_flat.reshape(B, T_s, -1).transpose(1, 2)
             layer_loss = F.mse_loss(stu_proj, tch_feat)
             self.log("train_layer_kd_loss", layer_loss, on_step=True, on_epoch=True)
-        # flow matching
-        flow_loss = torch.tensor(0.0, device=log_probs.device)
+        else:
+            layer_loss = torch.tensor(0.0, device=signal.device)
+        # log flow matching loss (already computed)
         if self.use_flow_matching:
-            assert stu_feat is not None and tch_feat is not None
-            flow_loss, _ = self.flow_matching(stu_feat, tch_feat)
             self.log("train_flow_matching_loss", flow_loss, on_step=True, on_epoch=True)
-        # total
-        loss = (
+        # total loss
+        total_loss = (
             ctc_loss
-            + (self.kd_alpha * kd_loss if self.logit_distillation else 0.0)
-            + (self.layer_kd_alpha * layer_loss if self.layerwise_distillation else 0.0)
-            + (flow_loss if self.use_flow_matching else 0.0)
+            + (self.kd_alpha * kd_loss if self.use_logit_distillation else 0.0)
+            + (self.layer_kd_alpha * layer_loss if self.use_layerwise_distillation else 0.0)
+            + flow_loss
         )
-        self.log("train_loss", loss, on_step=True, on_epoch=True)
-        return loss
-
+        self.log("train_loss", total_loss, on_step=True, on_epoch=True)
+        return total_loss
+    
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        signal, sig_len, transcript, transcript_len, sample_id = batch
+        log_probs, encoded_len, predictions, _ = self.forward(input_signal=signal, input_signal_length=sig_len)
+        transcribed = self.wer.decoding.ctc_decoder_predictions_tensor(
+            decoder_outputs=log_probs, decoder_lengths=encoded_len, return_hypotheses=False
+        )
+        if isinstance(sample_id, torch.Tensor):
+            sample_id = sample_id.cpu().numpy()
+        return list(zip(sample_id, transcribed))
+    
 def rectified_flow_schedule(t):
     alpha_t = t
     sigma_t = 1 - t
@@ -544,14 +602,10 @@ class FlowMatchingModule(nn.Module):
 
     def forward(self, s_f, t_f=None, target=None, inference_sampling: int = None):
         # s_f: student feature/logit, shape: (B, F, T) ex) torch.Size([32, 88, 422])
-        
         # t_f: teacher feature/logit, shape: (B, F', T') or None - ex) torch.Size([32, 176, 422])
         
-        all_p_t_f = []
         sampling_steps = self.training_sampling if self.training else (inference_sampling or self.inference_sampling)
-        loss = 0.0
         x = s_f # ex) torch.Size([32, 88, 422])
-        
         for i in reversed(range(1, sampling_steps + 1)):
             t = torch.full((s_f.size(0), 1), i / sampling_steps, device=s_f.device)
             embed_t = self.time_embed(t) # torch.Size([32, 32])
@@ -569,72 +623,26 @@ class FlowMatchingModule(nn.Module):
                 # 5) 다시 (B, feature_dim, T)
                 velocity = velocity.permute(0, 2, 1)
                 # ex) velocity.shape = torch.Size([32, 88, 411])
-
             else:
                 # cnn, swin 의 경우 기존 코드 유지
                 embed_t_expand = embed_t.unsqueeze(-1).expand(-1, -1, x.size(2))
                 embed_x = torch.cat([x, embed_t_expand], dim=1)
                 velocity = self.meta_encoder(embed_x)
-            
-            
             x = x - velocity / sampling_steps
-            
-            
+        # Compute loss only in training with shape transformation
+        loss = 0.0
+        if self.training and t_f is not None:
+            # shape transform student->teacher dim for loss
             if self.shape_transform_type == "linear":
-                # (B, feature_dim, T) → (B, T, feature_dim)
                 x_fc = x.permute(0, 2, 1)
-                # Linear(88→176) 적용: (B, T, feature_dim) → (B, T, teacher_dim)
-                y_fc = self.shape_transformation_function(x_fc)
-                # 다시 (B, teacher_dim, T)
-                p_t_f = y_fc.permute(0, 2, 1)
+                p_t_f = self.shape_transformation_function(x_fc).permute(0, 2, 1)
             else:
-                # conv1d, identity 등은 그대로
                 p_t_f = self.shape_transformation_function(x)
-            
-            
-            all_p_t_f.append(p_t_f)
-            if self.training and t_f is not None:
-                loss += self.metric_based_loss_function(p_t_f, t_f)
-            if self.training and target is not None:
-                loss += F.cross_entropy(p_t_f, target)
-        if self.training:
-            loss = loss * (self.weight / sampling_steps)
-            return loss, torch.stack(all_p_t_f, dim=0).mean(0)
-        else:
-            return 0.0, torch.stack(all_p_t_f, dim=0).mean(0)
-    # def forward(self, s_f, t_f=None, target=None, inference_sampling: int = 1):
-    #     all_p_t_f = []
-    #     if self.training:
-    #         if t_f is not None:
-    #             l = int(self.dirac_ratio * t_f.size(0))
-    #             perm = torch.randperm(t_f.size(0) - l, device=t_f.device)
-    #             t_f[l:] = t_f[l:][perm]
-    #         loss = 0.0
-    #         x = s_f
-    #         for i in reversed(range(1, self.training_sampling + 1)):
-    #             t = torch.full((s_f.size(0), 1), i / self.training_sampling, device=s_f.device)
-    #             embed_t = self.time_embed(t)
-    #             embed_x = x + embed_t
-    #             velocity = self.meta_encoder(embed_x)
-    #             x = x - velocity / self.training_sampling
-    #             p_t_f = self.shape_transformation_function(s_f - velocity)
-    #             all_p_t_f.append(p_t_f)
-    #             if t_f is not None:
-    #                 loss += self.metric_based_loss_function(p_t_f, t_f)
-    #             if target is not None:
-    #                 loss += F.cross_entropy(p_t_f, target)
-    #         loss = loss * (self.weight / self.training_sampling)
-    #         return loss, torch.stack(all_p_t_f, dim=0).mean(0)
-    #     else:
-    #         x = s_f
-    #         for i in reversed(range(1, inference_sampling + 1)):
-    #             t = torch.full((s_f.size(0), 1), i / inference_sampling, device=s_f.device)
-    #             embed_t = self.time_embed(t)
-    #             embed_x = x + embed_t
-    #             velocity = self.meta_encoder(embed_x)
-    #             x = x - velocity / inference_sampling
-    #             all_p_t_f.append(self.shape_transformation_function(s_f - velocity))
-    #         return 0.0, torch.stack(all_p_t_f, dim=0).mean(0)
+            loss = self.metric_based_loss_function(p_t_f, t_f)
+        # In inference or no teacher, no loss
+        return loss, x
+        # x 반환은 shape_transformation 전의 student feature
+        # 즉, shape_transformation은 loss 계산에만 사용됨
 
 def main():
     parser = argparse.ArgumentParser(
@@ -694,7 +702,13 @@ def main():
         help="True: teacher 모델 학습, False: student 모델 학습",
     )
     parser.add_argument(
-        "--logit_distillation",
+        "--use_ctc",
+        type=bool,
+        default=True,
+        help="CTC loss 사용 여부 (True: CTC, False: CrossEntropy)"
+    )
+    parser.add_argument(
+        "--use_logit_distillation",
         type=bool,
         default=False,
         help="CTC loss 외에 teacher logits 와의 KL-divergence loss 를 추가"
@@ -712,7 +726,7 @@ def main():
         help="softmax 온도 파라미터"
     )
     parser.add_argument(
-        "--layerwise_distillation", 
+        "--use_layerwise_distillation", 
         type=bool, 
         default=False,
         help="레이어 단위 KD 실행 여부"
@@ -926,24 +940,25 @@ def main():
                 cfg=model_cfg,
                 trainer=trainer,
                 teacher_model=teacher_model,
-                logit_distillation=args.logit_distillation,
+                use_ctc=args.use_ctc,
+                use_logit_distillation=args.use_logit_distillation,
                 kd_alpha=args.kd_alpha,
                 kd_temperature=args.kd_temperature,
-                layerwise_distillation=args.layerwise_distillation,
+                use_layerwise_distillation=args.use_layerwise_distillation,
                 layer_kd_alpha=args.layer_kd_alpha,
                 use_flow_matching=args.use_flow_matching,
                 flow_cfg=flow_cfg,
             )
-        elif args.logit_distillation or args.layerwise_distillation:
+        elif args.use_logit_distillation or args.use_layerwise_distillation:
             print(f'distillation 모델을 불러옵니다.')
             model = DistilEncDecCTCModelBPE(
                 cfg=model_cfg,
                 trainer=trainer,
                 teacher_model=teacher_model,
-                logit_distillation=args.logit_distillation,
+                use_logit_distillation=args.use_logit_distillation,
                 kd_alpha=args.kd_alpha,
                 kd_temperature=args.kd_temperature,
-                layerwise_distillation=args.layerwise_distillation,
+                use_layerwise_distillation=args.use_layerwise_distillation,
                 layer_kd_alpha=args.layer_kd_alpha,
             )
         else:

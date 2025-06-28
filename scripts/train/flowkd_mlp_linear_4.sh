@@ -15,12 +15,13 @@ CUDA_VISIBLE_DEVICES=1 python asr_train.py \
 --data_test_split test.clean \
 --batch_size 32 \
 --epochs 100 \
---logit_distillation True \
+--use_ctc True \
+--use_logit_distillation True \
+--use_layerwise_distillation False \
+--use_flow_matching True \
 --kd_temperature 1 \
 --kd_alpha 0.1 \
---layerwise_distillation False \
 --layer_kd_alpha 1.0 \
---use_flow_matching True \
 --flow_steps 4
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1
