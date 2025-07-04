@@ -400,15 +400,39 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         log_probs = self.decoder(encoder_output=encoder_out)
         greedy_preds = log_probs.argmax(dim=-1, keepdim=False)
         if self.training:
-            return log_probs, encoded_len, greedy_preds, flow_loss
+            return log_probs, encoded_len, greedy_preds, flow_loss, encoder_out
         else:
             return log_probs, encoded_len, greedy_preds
     
     def training_step(self, batch, batch_idx):
         signal, sig_len, transcript, transcript_len = batch
-        # forward with flow loss
-        log_probs, encoded_len, _, flow_loss = self.forward(input_signal=signal, input_signal_length=sig_len)
-        # CTC loss
+
+        # 1) Student: preprocess + encode 한 번
+        proc_s, len_s = self.preprocessor(input_signal=signal, length=sig_len)
+        stu_feat, encoded_len = self.encoder(audio_signal=proc_s, length=len_s)
+
+        # 2) Teacher: preprocess+encode 한 번, decoder 한 번 (no grad)
+        with torch.no_grad():
+            proc_t, len_t = self.teacher.preprocessor(
+                input_signal=signal, length=sig_len
+            )
+            tch_feat, _ = self.teacher.encoder(
+                audio_signal=proc_t, length=len_t
+            )
+            tch_logp = self.teacher.decoder(encoder_output=tch_feat)
+
+        # 3) Flow matching (uses stu_feat ⭢ new encoder_out) 
+        if self.use_flow_matching:
+            flow_loss, encoder_out = self.flow_matching(stu_feat, tch_feat)
+        else:
+            flow_loss = torch.tensor(0.0, device=stu_feat.device)
+            encoder_out = stu_feat
+
+        # 4) Decode student once (with matched features)
+        log_probs = self.decoder(encoder_output=encoder_out)
+        greedy_preds = log_probs.argmax(dim=-1)
+
+        # 5) CTC loss
         if self.use_ctc:
             ctc_loss = self.loss(
                 log_probs=log_probs,
@@ -418,47 +442,45 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             )
         else:
             ctc_loss = torch.tensor(0.0, device=log_probs.device)
-            self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
-        
-        # logit distillation loss
-        kd_loss = torch.tensor(0.0, device=log_probs.device)
+
+        # 6) Logit distillation (KL-divergence)
         if self.use_logit_distillation:
-            with torch.no_grad():
-                tch_logp, _, _ = self.teacher.forward(input_signal=signal, input_signal_length=sig_len)
             stu_logp = F.log_softmax(log_probs / self.temperature, dim=-1)
-            tch_p = F.softmax(tch_logp / self.temperature, dim=-1)
-            kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (self.temperature ** 2)
-            self.log("train_kd_loss", kd_loss, on_step=True, on_epoch=True)
+            tch_p    = F.softmax(tch_logp   / self.temperature, dim=-1)
+            kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") \
+                       * (self.temperature ** 2)
         else:
-            kd_loss = torch.tensor(0.0, device=signal.device)
-        # layerwise distillation loss
+            kd_loss = torch.tensor(0.0, device=log_probs.device)
+
+        # 7) Layerwise distillation (student feature vs. teacher feature)
         if self.use_layerwise_distillation:
-            proc_sig, proc_len = self.preprocessor(input_signal=signal, length=sig_len)
-            stu_feat, _ = self.encoder(audio_signal=proc_sig, length=proc_len)
-            with torch.no_grad():
-                proc_t, proc_tlen = self.teacher.preprocessor(input_signal=signal, length=sig_len)
-                tch_feat, _ = self.teacher.encoder(audio_signal=proc_t, length=proc_tlen)
-            if self.layer_proj is None:
-                self._init_layer_proj(stu_feat, tch_feat)
+            # stu_feat: 원래 encoder 출력 (before flow)
             B, H_s, T_s = stu_feat.size()
-            stu_flat = stu_feat.transpose(1, 2).reshape(-1, H_s)
+            if getattr(self, 'layer_proj', None) is None:
+                self._init_layer_proj(stu_feat, tch_feat)
+            stu_flat  = stu_feat.transpose(1,2).reshape(-1, H_s)
             proj_flat = self.layer_proj(stu_flat)
-            stu_proj = proj_flat.reshape(B, T_s, -1).transpose(1, 2)
+            stu_proj  = proj_flat.reshape(B, T_s, -1).transpose(1,2)
             layer_loss = F.mse_loss(stu_proj, tch_feat)
-            self.log("train_layer_kd_loss", layer_loss, on_step=True, on_epoch=True)
         else:
             layer_loss = torch.tensor(0.0, device=signal.device)
-        # log flow matching loss (already computed)
-        if self.use_flow_matching:
-            self.log("train_flow_matching_loss", flow_loss, on_step=True, on_epoch=True)
-        # total loss
+
+        # 8) Total loss & logging
         total_loss = (
             ctc_loss
             + (self.kd_alpha * kd_loss if self.use_logit_distillation else 0.0)
             + (self.layer_kd_alpha * layer_loss if self.use_layerwise_distillation else 0.0)
             + flow_loss
         )
+        self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
+        if self.use_logit_distillation:
+            self.log("train_kd_loss", kd_loss, on_step=True, on_epoch=True)
+        if self.use_layerwise_distillation:
+            self.log("train_layer_kd_loss", layer_loss, on_step=True, on_epoch=True)
+        if self.use_flow_matching:
+            self.log("train_flow_matching_loss", flow_loss, on_step=True, on_epoch=True)
         self.log("train_loss", total_loss, on_step=True, on_epoch=True)
+
         return total_loss
     
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
@@ -528,19 +550,26 @@ class MLPEncoder(nn.Module):
 class SwinTransformerEncoder(nn.Module):
     def __init__(self, in_dim, out_dim, num_heads=4):
         super().__init__()
-        # 간단화 버전 (실제 사용시 SwinAttention module로 교체)
-        self.attn = nn.MultiheadAttention(in_dim, num_heads)
+        self.attn   = nn.MultiheadAttention(embed_dim=in_dim, num_heads=num_heads)
         self.linear1 = nn.Linear(in_dim, out_dim)
-        self.relu = nn.ReLU()
+        self.relu    = nn.ReLU()
         self.linear2 = nn.Linear(out_dim, out_dim)
+
     def forward(self, x):
-        # x: (B, F) → (1, B, F) for MultiheadAttention
-        x_attn, _ = self.attn(x.unsqueeze(0), x.unsqueeze(0), x.unsqueeze(0))
-        x_attn = x_attn.squeeze(0)
-        x = self.linear1(x_attn)
-        x = self.relu(x)
-        x = self.linear2(x)
-        return x
+        # x: (B, C, T)
+        # 1) (B, C, T) → (T, B, C), 시퀀스 길이 기준으로 MHA 호출
+        x_seq = x.permute(2, 0, 1)               # [T, B, C]
+        attn_out, _ = self.attn(x_seq, x_seq, x_seq)
+        # 2) 다시 (B, C, T) 로 되돌리기
+        attn_out = attn_out.permute(1, 2, 0)     # [B, C, T]
+        # 3) 채널 차원에 대해 pointwise FFN
+        #    (B, C, T) → (B, T, C)
+        h = attn_out.permute(0, 2, 1)            # [B, T, C]
+        h = self.linear1(h)                     # [B, T, out_dim]
+        h = self.relu(h)
+        h = self.linear2(h)                     # [B, T, out_dim]
+        # 4) (B, out_dim, T) 로 돌려서 Conv1d 분기와 동일한 포맷으로
+        return h.permute(0, 2, 1)               # [B, out_dim, T]
 class CNNEncoder(nn.Module):
     # for image classification
     def __init__(self, in_ch, out_ch):
@@ -567,6 +596,8 @@ class FlowMatchingModule(nn.Module):
         self.weight = flow_cfg.get("weight", 1.0)
         self.feature_dim = flow_cfg.get("student_dim", 88)
         self.teacher_dim = flow_cfg.get("teacher_dim", 176)
+        self.student_head_num = flow_cfg.get("student_head_num", 4)
+        self.teacher_head_num = flow_cfg.get("teacher_head_num", 8)
 
         # time embedding
         self.time_embed = nn.Linear(1, time_embed_dim)
@@ -581,12 +612,21 @@ class FlowMatchingModule(nn.Module):
         elif self.meta_encoder_type == "cnn":
             # 예시: 1D conv
             self.meta_encoder = nn.Sequential(
-                nn.Conv1d(self.feature_dim, self.feature_dim, kernel_size=3, padding=1),
+                nn.Conv1d(self.feature_dim+time_embed_dim, self.feature_dim, kernel_size=3, padding=1),
                 nn.ReLU(),
                 nn.Conv1d(self.feature_dim, self.feature_dim, kernel_size=1)
             )
         elif self.meta_encoder_type == "swin":
-            self.meta_encoder = SwinTransformerEncoder(self.feature_dim + time_embed_dim, self.feature_dim)
+            self.meta_encoder = SwinTransformerEncoder(self.feature_dim + time_embed_dim, self.feature_dim, self.student_head_num)
+        elif self.meta_encoder_type == "conformer":
+            ConformerBlock(
+                d_model=self.feature_dim+time_embed_dim,
+                num_attention_heads=4,
+                ffn_expansion_factor=4,
+                conv_expansion_factor=2,
+                dropout=0.1,
+            )
+            
         else:
             raise ValueError(f"Unknown meta_encoder type: {self.meta_encoder_type}")
 
@@ -652,8 +692,10 @@ class FlowMatchingModule(nn.Module):
                 # ex) velocity.shape = torch.Size([32, 88, 422])
             else:
                 # cnn, swin 의 경우 기존 코드 유지
-                embed_t_expand = embed_t.unsqueeze(-1).expand(-1, -1, x.size(2))
-                embed_x = torch.cat([x, embed_t_expand], dim=1)
+                # cnn 분기: 시간 임베딩을 (B, T, E) → (B, E, T) 로 permute
+                embed_t_perm = embed_t.permute(0, 2, 1)       # [B, E, T]
+                # student feature x: (B, F, T) 과 채널 차원으로 concat
+                embed_x = torch.cat([x, embed_t_perm], dim=1) # [B, F+E, T]
                 velocity = self.meta_encoder(embed_x)
             x = x - velocity / sampling_steps
         # Compute loss only in training with shape transformation
@@ -814,6 +856,13 @@ def main():
         action="store_true",
         help="테스트 모드일 때 True로 설정하면 데이터셋을 매우 적게 사용"
     )
+    parser.add_argument(
+        "--meta_encoder_type",
+        type=str,
+        default="mlp",
+        choices=["mlp", "cnn", "swin"],
+        help="Flow Matching 시 사용되는 메타 인코더 architecture"
+    )
     args = parser.parse_args()
 
     # manifest 경로 설정
@@ -962,7 +1011,7 @@ def main():
     else:
         if args.use_flow_matching:
             flow_cfg = {
-                    "meta_encoder_type": "mlp",   # ["mlp", "cnn", "swin"]
+                    "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin"]
                     "feature_dim": model_cfg.encoder.d_model,
                     "time_embed_dim": 32,
                     "hidden_dim": 128,
@@ -974,7 +1023,8 @@ def main():
                     "shape_transform": "linear",  # or "linear", "conv1d" 등
                     "student_dim": model_cfg.encoder.d_model,  # student 모델의 feature dim
                     "teacher_dim": teacher_model.cfg.encoder.d_model,  # teacher 모델의 feature dim
-                    
+                    "student_head_num": model_cfg.encoder.n_heads,  # student 모델의 head 수
+                    "teacher_head_num": teacher_model.cfg.encoder.n_heads,  # teacher 모델의 head
                     # 필요하다면 cnn일 경우 in_ch, out_ch 등 추가
                 }
             model = DistilFlowMatchingCTCModelBPE(
