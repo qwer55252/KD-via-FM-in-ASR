@@ -483,6 +483,28 @@ def ve_ode_schedule(t, a=0.02, b=100):
     alpha_t = a * (b / a) ** t
     sigma_t = torch.ones_like(t)
     return alpha_t, sigma_t
+def rectified_flow_schedule_deriv(t):
+    # alpha_t = t, sigma_t = 1 - t
+    dalpha_dt = torch.ones_like(t)
+    dsigma_dt = -torch.ones_like(t)
+    return dalpha_dt, dsigma_dt
+def vp_ode_schedule_deriv(t, a=19.9, b=0.1):
+    # alpha_t = exp(-0.25 * a * (1-t)^2 - 0.5 * b * (1-t))
+    # d(alpha_t)/dt = alpha_t * [0.5*a*(1-t) + 0.5*b]
+    alpha_t = torch.exp(-0.25 * a * (1 - t) ** 2 - 0.5 * b * (1 - t))
+    dalpha_dt = alpha_t * (0.5 * a * (1 - t) + 0.5 * b)
+    # sigma_t = sqrt(1 - alpha_t^2)
+    sigma_t = torch.sqrt(1 - alpha_t ** 2)
+    dsigma_dt = -alpha_t * dalpha_dt / sigma_t
+    return dalpha_dt, dsigma_dt
+def ve_ode_schedule_deriv(t, a=0.02, b=100):
+    # alpha_t = a * (b/a)^t
+    # d(alpha_t)/dt = alpha_t * log(b/a)
+    alpha_t = a * (b / a) ** t
+    dalpha_dt = alpha_t * torch.log(torch.tensor(b / a, device=t.device, dtype=t.dtype))
+    # sigma_t = 1, dsigma_dt = 0
+    dsigma_dt = torch.zeros_like(t)
+    return dalpha_dt, dsigma_dt
 
 class MLPEncoder(nn.Module):
     def __init__(self, in_dim, out_dim, num_layers=2):
@@ -581,7 +603,7 @@ class FlowMatchingModule(nn.Module):
             raise ValueError(f"Unknown shape_transform type: {shape_transform}")
 
         # loss 선택
-        loss_type = flow_cfg.get("loss", "mse")
+        loss_type = flow_cfg.get("loss", "mse") # default: mse
         if loss_type == "mse":
             self.metric_based_loss_function = nn.MSELoss()
         elif loss_type == "cosine":
@@ -593,10 +615,13 @@ class FlowMatchingModule(nn.Module):
         noise_schedule = flow_cfg.get("noise_schedule", "rectified")
         if noise_schedule == "rectified":
             self.noise_schedule = rectified_flow_schedule
+            self.noise_schedule_deriv = rectified_flow_schedule_deriv
         elif noise_schedule == "vp_ode":
             self.noise_schedule = vp_ode_schedule
+            self.noise_schedule_deriv = vp_ode_schedule_deriv
         elif noise_schedule == "ve_ode":
             self.noise_schedule = ve_ode_schedule
+            self.noise_schedule_deriv = ve_ode_schedule_deriv
         else:
             raise NotImplementedError
 
@@ -607,22 +632,24 @@ class FlowMatchingModule(nn.Module):
         sampling_steps = self.training_sampling if self.training else (inference_sampling or self.inference_sampling)
         x = s_f # ex) torch.Size([32, 88, 422])
         for i in reversed(range(1, sampling_steps + 1)):
-            t = torch.full((s_f.size(0), 1), i / sampling_steps, device=s_f.device)
-            embed_t = self.time_embed(t) # torch.Size([32, 32])
+            t = torch.full((s_f.size(0), 1, s_f.size(2)), i / sampling_steps, device=s_f.device) # [32, 1, 422]
+            t = t.permute(0, 2, 1) # [32, 422, 1]
+            embed_t = self.time_embed(t) # Size: [32, 422, 1] -> [32, 422, 32]
+            # embed_t = embed_t.permute(0, 2, 1) # [32, 32, 422]
             
             if self.meta_encoder_type == "mlp":
                 # 1) (B, feature_dim, T) → (B, T, feature_dim)
-                x_perm = x.permute(0, 2, 1)
+                x_perm = x.permute(0, 2, 1) # torch.Size([32, 422, 88])
                 # 2) (B, T, feature_dim) → (B, T, time_embed_dim)
-                t_expand = embed_t.unsqueeze(1).expand(-1, x_perm.size(1), -1)
+                # t = embed_t.unsqueeze(1).expand(-1, x_perm.size(1), -1)
                 # 3) concat → (B, T, feature_dim + time_embed_dim)
-                embed_x = torch.cat([x_perm, t_expand], dim=-1)
+                embed_x = torch.cat([x_perm, embed_t], dim=-1) # torch.Size([32, 422, 120])
                 # ex) embed_x.shape = torch.Size([32, 411, 120])
                 # 4) MLP 적용 → (B, T, feature_dim)
-                velocity = self.meta_encoder(embed_x) 
+                velocity = self.meta_encoder(embed_x) # torch.Size([32, 422, 88])
                 # 5) 다시 (B, feature_dim, T)
                 velocity = velocity.permute(0, 2, 1)
-                # ex) velocity.shape = torch.Size([32, 88, 411])
+                # ex) velocity.shape = torch.Size([32, 88, 422])
             else:
                 # cnn, swin 의 경우 기존 코드 유지
                 embed_t_expand = embed_t.unsqueeze(-1).expand(-1, -1, x.size(2))
@@ -632,13 +659,27 @@ class FlowMatchingModule(nn.Module):
         # Compute loss only in training with shape transformation
         loss = 0.0
         if self.training and t_f is not None:
+            # noise schedule 적용
+
+            # student, teacher feature noise schedule
+            # alpha_t, sigma_t = self.noise_schedule(t)
+            # t.shape : torch.Size([32, 422, 1])
+            t = t.permute(0, 2, 1)  # [32, 1, 422]
+            dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t)
+            # \frac{\nabla_t \alpha_t Z_1 - g_{v_\theta}\left(Z_{1-i/N}, 1-i/N\right)}{-\nabla_t \sigma_t} 적용
+            # velocity.shape : torch.Size([32, 88, 422])
+            # s_f.shape : torch.Size([32, 88, 422])
+            noise_scheduled_x = (dalpha_dt * s_f - velocity) / (-dsigma_dt)
+            # noise_scheduled_t_f = alpha_t * transformed_s_f + sigma_t * t_f
+            # loss = self.metric_based_loss_function(transformed_s_f, noise_scheduled_t_f)
+
             # shape transform student->teacher dim for loss
             if self.shape_transform_type == "linear":
-                x_fc = x.permute(0, 2, 1)
-                p_t_f = self.shape_transformation_function(x_fc).permute(0, 2, 1)
+                noise_scheduled_x = noise_scheduled_x.permute(0, 2, 1)
+                transformed_s_f = self.shape_transformation_function(noise_scheduled_x).permute(0, 2, 1)
             else:
-                p_t_f = self.shape_transformation_function(x)
-            loss = self.metric_based_loss_function(p_t_f, t_f)
+                transformed_s_f = self.shape_transformation_function(noise_scheduled_x)
+            loss = self.metric_based_loss_function(transformed_s_f, t_f)
         # In inference or no teacher, no loss
         return loss, x
         # x 반환은 shape_transformation 전의 student feature
