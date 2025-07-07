@@ -671,6 +671,7 @@ class FlowMatchingModule(nn.Module):
         
         sampling_steps = self.training_sampling if self.training else (inference_sampling or self.inference_sampling)
         x = s_f # ex) torch.Size([32, 88, 422])
+        velocities = []
         for i in reversed(range(1, sampling_steps + 1)):
             t = torch.full((s_f.size(0), 1, s_f.size(2)), i / sampling_steps, device=s_f.device) # [32, 1, 422]
             t = t.permute(0, 2, 1) # [32, 422, 1]
@@ -697,33 +698,31 @@ class FlowMatchingModule(nn.Module):
                 # student feature x: (B, F, T) 과 채널 차원으로 concat
                 embed_x = torch.cat([x, embed_t_perm], dim=1) # [B, F+E, T]
                 velocity = self.meta_encoder(embed_x)
-            x = x - velocity / sampling_steps
+            velocities.append(velocity) # velocity: (B, F, T)
+            # x = x - velocity / sampling_steps
         # Compute loss only in training with shape transformation
         loss = 0.0
+        # noise schedule 적용
+        # student, teacher feature noise schedule
+        # alpha_t, sigma_t = self.noise_schedule(t)
+        # t.shape : torch.Size([32, 422, 1])
+        t = t.permute(0, 2, 1)  # [32, 1, 422]
+        dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t)
+        # \frac{\nabla_t \alpha_t Z_1 - g_{v_\theta}\left(Z_{1-i/N}, 1-i/N\right)}{-\nabla_t \sigma_t} 적용
+        # velocity.shape : torch.Size([32, 88, 422])
+        # s_f.shape : torch.Size([32, 88, 422])
+        # noise_scheduled_t_f = alpha_t * transformed_s_f + sigma_t * t_f
+        # loss = self.metric_based_loss_function(transformed_s_f, noise_scheduled_t_f)
+        noise_scheduled_x = (dalpha_dt * s_f - torch.stack(velocities, dim=0).mean(0)) / (-dsigma_dt)
         if self.training and t_f is not None:
-            # noise schedule 적용
-
-            # student, teacher feature noise schedule
-            # alpha_t, sigma_t = self.noise_schedule(t)
-            # t.shape : torch.Size([32, 422, 1])
-            t = t.permute(0, 2, 1)  # [32, 1, 422]
-            dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t)
-            # \frac{\nabla_t \alpha_t Z_1 - g_{v_\theta}\left(Z_{1-i/N}, 1-i/N\right)}{-\nabla_t \sigma_t} 적용
-            # velocity.shape : torch.Size([32, 88, 422])
-            # s_f.shape : torch.Size([32, 88, 422])
-            noise_scheduled_x = (dalpha_dt * s_f - velocity) / (-dsigma_dt)
-            # noise_scheduled_t_f = alpha_t * transformed_s_f + sigma_t * t_f
-            # loss = self.metric_based_loss_function(transformed_s_f, noise_scheduled_t_f)
-
             # shape transform student->teacher dim for loss
             if self.shape_transform_type == "linear":
-                noise_scheduled_x = noise_scheduled_x.permute(0, 2, 1)
-                transformed_s_f = self.shape_transformation_function(noise_scheduled_x).permute(0, 2, 1)
+                transformed_s_f = self.shape_transformation_function(noise_scheduled_x.permute(0, 2, 1)).permute(0, 2, 1)
             else:
                 transformed_s_f = self.shape_transformation_function(noise_scheduled_x)
             loss = self.metric_based_loss_function(transformed_s_f, t_f)
         # In inference or no teacher, no loss
-        return loss, x
+        return loss, noise_scheduled_x
         # x 반환은 shape_transformation 전의 student feature
         # 즉, shape_transformation은 loss 계산에만 사용됨
 
