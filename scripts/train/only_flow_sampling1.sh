@@ -1,6 +1,6 @@
 export HF_DATASETS_CACHE="/root/.cache/huggingface/datasets"
 export PRJ_NAME="FlowMatching_KD"
-export EXP_NAME="only_flow"
+export EXP_NAME="only_flow_sampling1"
 
 # 1) 출력 디렉토리 생성
 OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
@@ -22,6 +22,6 @@ CUDA_VISIBLE_DEVICES=0 python asr_train.py \
 --kd_temperature 1 \
 --kd_alpha 0.1 \
 --layer_kd_alpha 1.0 \
---flow_steps 2
+--flow_steps 1
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1
