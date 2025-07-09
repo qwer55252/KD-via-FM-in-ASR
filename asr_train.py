@@ -9,6 +9,7 @@ Weights & Biases 로깅 포함
 
 import os
 import json
+import shutil
 import argparse
 import torch.nn as nn
 from ruamel.yaml import YAML
@@ -583,6 +584,146 @@ class CNNEncoder(nn.Module):
         )
     def forward(self, x):
         return self.block(x)
+class UNet1D(nn.Module):
+    def __init__(self, in_ch, base_ch, out_ch, num_layers=4):
+        super().__init__()
+        self.down_channels = []
+        ch = in_ch
+        self.downs = nn.ModuleList()
+        for i in range(num_layers):
+            outc = base_ch * (2**i)
+            self.downs.append(nn.Conv1d(ch, outc, 4, 2, 1))
+            self.down_channels.append(outc)
+            ch = outc
+        self.bottleneck = nn.Conv1d(ch, ch, 3, 1, 1)
+        # up path
+        self.ups = nn.ModuleList()
+        # reversed skip channels
+        for skip_c in reversed(self.down_channels):
+            in_c = ch + skip_c
+            out_c = skip_c
+            self.ups.append(nn.ConvTranspose1d(in_c, out_c, 4, 2, 1))
+            ch = out_c
+        self.final = nn.Conv1d(ch, out_ch, 1)
+
+    def forward(self, x):
+        skips = []
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+        x = self.bottleneck(x)
+        for up in self.ups:
+            skip = skips.pop()
+            # 만약 길이가 안 맞으면 크롭/패딩
+            if x.size(2) != skip.size(2):
+                diff = skip.size(2) - x.size(2)
+                x = F.pad(x, (0, diff))  # 또는 x = x[..., :skip.size(2)]
+            x = torch.cat([x, skip], dim=1)
+            x = up(x)
+        return self.final(x)
+# ---------------- Conformer Modules ----------------
+class FeedForwardModule(nn.Module):
+    def __init__(self, dim, mult=4, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * mult),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * mult, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+class ConvModule(nn.Module):
+    def __init__(self, dim, expansion_factor=2, kernel_size=31, dropout=0.1):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(dim)
+        self.pointwise_conv1 = nn.Conv1d(dim, dim * expansion_factor, kernel_size=1)
+        self.depthwise_conv = nn.Conv1d(
+            dim * expansion_factor,
+            dim * expansion_factor,
+            kernel_size=kernel_size,
+            groups=dim * expansion_factor,
+            padding=kernel_size // 2
+        )
+        self.batch_norm = nn.BatchNorm1d(dim * expansion_factor)
+        self.activation = nn.SiLU()
+        self.pointwise_conv2 = nn.Conv1d(dim * expansion_factor, dim, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, T, C) -> (B, C, T) for conv
+        x = self.layer_norm(x)
+        x = x.transpose(1, 2)
+        x = self.pointwise_conv1(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+        x = self.pointwise_conv2(x)
+        x = x.transpose(1, 2)
+        return self.dropout(x)
+class ConformerBlock(nn.Module):
+    def __init__(self, dim, heads, ff_mult=4, conv_expansion=2, conv_kernel=31, dropout=0.1):
+        super().__init__()
+        self.ff1 = FeedForwardModule(dim, mult=ff_mult, dropout=dropout)
+        self.norm_ff1 = nn.LayerNorm(dim)
+        self.mha_layer = nn.LayerNorm(dim)
+        self.mha = nn.MultiheadAttention(dim, num_heads=heads, dropout=dropout, batch_first=True)
+        self.conv_module = ConvModule(dim, expansion_factor=conv_expansion, kernel_size=conv_kernel, dropout=dropout)
+        self.ff2 = FeedForwardModule(dim, mult=ff_mult, dropout=dropout)
+        self.norm_ff2 = nn.LayerNorm(dim)
+        self.norm_final = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        # Feed Forward module 1 (half-step)
+        residual = x
+        x = self.norm_ff1(x)
+        x = self.ff1(x)
+        x = residual + 0.5 * x
+
+        # Multi-Head Self-Attention
+        residual = x
+        x = self.mha_layer(x)
+        x,_ = self.mha(x, x, x)
+        x = residual + x
+
+        # Convolution Module
+        residual = x
+        x = self.conv_module(x)
+        x = residual + x
+
+        # Feed Forward module 2 (half-step)
+        residual = x
+        x = self.norm_ff2(x)
+        x = self.ff2(x)
+        x = residual + 0.5 * x
+
+        # Final layer norm
+        return self.norm_final(x)
+class ConformerEncoder(nn.Module):
+    def __init__(self, input_dim, encoder_dim, num_heads, ff_mult=4, conv_expansion_factor=2, num_layers=4, dropout=0.1):
+        super().__init__()
+        # initial projection if needed
+        self.input_proj = nn.Linear(input_dim, encoder_dim) if input_dim != encoder_dim else nn.Identity()
+        self.layers = nn.ModuleList([
+            ConformerBlock(
+                dim=encoder_dim,
+                heads=num_heads,
+                ff_mult=ff_mult,
+                conv_expansion=conv_expansion_factor,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        # x: (B, T, input_dim)
+        x = self.input_proj(x)
+        for layer in self.layers:
+            x = layer(x)
+        # return (B, T, encoder_dim)
+        return x
 
 class FlowMatchingModule(nn.Module):
     def __init__(self, flow_cfg):
@@ -619,14 +760,23 @@ class FlowMatchingModule(nn.Module):
         elif self.meta_encoder_type == "swin":
             self.meta_encoder = SwinTransformerEncoder(self.feature_dim + time_embed_dim, self.feature_dim, self.student_head_num)
         elif self.meta_encoder_type == "conformer":
-            ConformerBlock(
-                d_model=self.feature_dim+time_embed_dim,
-                num_attention_heads=4,
-                ffn_expansion_factor=4,
+            # Conformer 기반 flow 네트워크
+            self.meta_encoder = ConformerEncoder(
+                input_dim=self.feature_dim + time_embed_dim,
+                encoder_dim=hidden_dim,
+                num_heads=self.student_head_num,
+                ff_mult=4,
                 conv_expansion_factor=2,
-                dropout=0.1,
+                num_layers=4
             )
-            
+        elif self.meta_encoder_type == "unet":
+            # 1D U-Net 기반 flow 네트워크
+            self.meta_encoder = UNet1D(
+                in_ch=self.feature_dim + time_embed_dim,
+                base_ch=hidden_dim,
+                out_ch=self.feature_dim,
+                num_layers=4
+            )
         else:
             raise ValueError(f"Unknown meta_encoder type: {self.meta_encoder_type}")
 
@@ -666,65 +816,47 @@ class FlowMatchingModule(nn.Module):
             raise NotImplementedError
 
     def forward(self, s_f, t_f=None, target=None, inference_sampling: int = None):
-        # s_f: student feature/logit, shape: (B, F, T) ex) torch.Size([32, 88, 422])
-        # t_f: teacher feature/logit, shape: (B, F', T') or None - ex) torch.Size([32, 176, 422])
-        
         sampling_steps = self.training_sampling if self.training else (inference_sampling or self.inference_sampling)
-        x = s_f # ex) torch.Size([32, 88, 422])
-        velocities = []
+        x = s_f
         for i in reversed(range(1, sampling_steps + 1)):
-            t = torch.full((s_f.size(0), 1, s_f.size(2)), i / sampling_steps, device=s_f.device) # [32, 1, 422]
-            t = t.permute(0, 2, 1) # [32, 422, 1]
-            embed_t = self.time_embed(t) # Size: [32, 422, 1] -> [32, 422, 32]
-            # embed_t = embed_t.permute(0, 2, 1) # [32, 32, 422]
-            
+            t = torch.full((s_f.size(0), 1, s_f.size(2)), i / sampling_steps, device=s_f.device)
+            t = t.permute(0, 2, 1)
+            embed_t = self.time_embed(t)
             if self.meta_encoder_type == "mlp":
-                # 1) (B, feature_dim, T) → (B, T, feature_dim)
-                x_perm = x.permute(0, 2, 1) # torch.Size([32, 422, 88])
-                # 2) (B, T, feature_dim) → (B, T, time_embed_dim)
-                # t = embed_t.unsqueeze(1).expand(-1, x_perm.size(1), -1)
-                # 3) concat → (B, T, feature_dim + time_embed_dim)
-                embed_x = torch.cat([x_perm, embed_t], dim=-1) # torch.Size([32, 422, 120])
-                # ex) embed_x.shape = torch.Size([32, 411, 120])
-                # 4) MLP 적용 → (B, T, feature_dim)
-                velocity = self.meta_encoder(embed_x) # torch.Size([32, 422, 88])
-                # 5) 다시 (B, feature_dim, T)
-                velocity = velocity.permute(0, 2, 1)
-                # ex) velocity.shape = torch.Size([32, 88, 422])
-            else:
-                # cnn, swin 의 경우 기존 코드 유지
-                # cnn 분기: 시간 임베딩을 (B, T, E) → (B, E, T) 로 permute
-                embed_t_perm = embed_t.permute(0, 2, 1)       # [B, E, T]
-                # student feature x: (B, F, T) 과 채널 차원으로 concat
-                embed_x = torch.cat([x, embed_t_perm], dim=1) # [B, F+E, T]
+                x_perm = x.permute(0, 2, 1)
+                embed_x = torch.cat([x_perm, embed_t], dim=-1)
                 velocity = self.meta_encoder(embed_x)
-            velocities.append(velocity) # velocity: (B, F, T)
-            # x = x - velocity / sampling_steps
-        # Compute loss only in training with shape transformation
+                velocity = velocity.permute(0, 2, 1)
+            else:
+                embed_t_perm = embed_t.permute(0, 2, 1)
+                embed_x = torch.cat([x, embed_t_perm], dim=1)
+                velocity = self.meta_encoder(embed_x)
+            
+            if self.meta_encoder_type == "unet":
+                # time-dim 이 x 와 다를 때, crop 또는 pad 로 맞춰주기
+                T_x = x.size(2)
+                T_v = velocity.size(2)
+                if T_v != T_x:
+                    if T_v > T_x:
+                        # 너무 길면 앞쪽 T_x 만큼만
+                        velocity = velocity[:, :, :T_x]
+                    else:
+                        # 너무 짧으면 뒤쪽에 0 패딩
+                        pad_amt = T_x - T_v
+                        velocity = F.pad(velocity, (0, pad_amt))
+            x = x - velocity / sampling_steps
         loss = 0.0
-        # noise schedule 적용
-        # student, teacher feature noise schedule
-        # alpha_t, sigma_t = self.noise_schedule(t)
-        # t.shape : torch.Size([32, 422, 1])
-        t = t.permute(0, 2, 1)  # [32, 1, 422]
-        dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t)
-        # \frac{\nabla_t \alpha_t Z_1 - g_{v_\theta}\left(Z_{1-i/N}, 1-i/N\right)}{-\nabla_t \sigma_t} 적용
-        # velocity.shape : torch.Size([32, 88, 422])
-        # s_f.shape : torch.Size([32, 88, 422])
-        # noise_scheduled_t_f = alpha_t * transformed_s_f + sigma_t * t_f
-        # loss = self.metric_based_loss_function(transformed_s_f, noise_scheduled_t_f)
-        noise_scheduled_x = (dalpha_dt * s_f - torch.stack(velocities, dim=0).mean(0)) / (-dsigma_dt)
         if self.training and t_f is not None:
-            # shape transform student->teacher dim for loss
+            t = t.permute(0, 2, 1)
+            dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t)
+            noise_scheduled_x = (dalpha_dt * s_f - velocity) / (-dsigma_dt)
             if self.shape_transform_type == "linear":
-                transformed_s_f = self.shape_transformation_function(noise_scheduled_x.permute(0, 2, 1)).permute(0, 2, 1)
+                noise_scheduled_x = noise_scheduled_x.permute(0, 2, 1)
+                transformed_s_f = self.shape_transformation_function(noise_scheduled_x).permute(0, 2, 1)
             else:
                 transformed_s_f = self.shape_transformation_function(noise_scheduled_x)
             loss = self.metric_based_loss_function(transformed_s_f, t_f)
-        # In inference or no teacher, no loss
-        return loss, noise_scheduled_x
-        # x 반환은 shape_transformation 전의 student feature
-        # 즉, shape_transformation은 loss 계산에만 사용됨
+        return loss, x
 
 def main():
     parser = argparse.ArgumentParser(
@@ -859,13 +991,14 @@ def main():
         "--meta_encoder_type",
         type=str,
         default="mlp",
-        choices=["mlp", "cnn", "swin"],
+        choices=["mlp", "cnn", "swin", "conformer", "unet"],
         help="Flow Matching 시 사용되는 메타 인코더 architecture"
     )
     args = parser.parse_args()
 
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
+    shutil.copy(__file__, os.path.join(args.output_dir, os.path.basename(__file__)))
     manifest_dir = os.path.join(args.data_dir, "manifests")
     os.makedirs(manifest_dir, exist_ok=True)
     # train_manifest = os.path.join(args.data_dir, "manifests", "train-clean-100.json")
@@ -1010,7 +1143,7 @@ def main():
     else:
         if args.use_flow_matching:
             flow_cfg = {
-                    "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin"]
+                    "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin", "unet", "conformer"]
                     "feature_dim": model_cfg.encoder.d_model,
                     "time_embed_dim": 32,
                     "hidden_dim": 128,
