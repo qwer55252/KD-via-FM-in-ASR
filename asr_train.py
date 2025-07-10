@@ -156,6 +156,16 @@ def make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_
     
     return student_cfg
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = v.lower()
+    if v in ("yes", "true", "t", "y", "1"):
+        return True
+    if v in ("no",  "false","f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
+
 class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def __init__(self, cfg, trainer, teacher_model, use_logit_distillation=True, kd_alpha=0.1, kd_temperature=1.0, use_layerwise_distillation=False, layer_kd_alpha=1.0):
         super().__init__(cfg=cfg, trainer=trainer)
@@ -255,10 +265,10 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             T = self.temperature
             stu_logp = F.log_softmax(log_probs / T, dim=-1)
             tch_p    = F.softmax(tch_log_probs  / T, dim=-1)
-            kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T*T)
-            self.log("train_kd_loss", kd_loss, prog_bar=False, on_step=True, on_epoch=True)
+            logit_kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T*T)
+            self.log("train_kd_loss", logit_kd_loss, prog_bar=False, on_step=True, on_epoch=True)
         else:
-            kd_loss = torch.tensor(0.0, device=log_probs.device)
+            logit_kd_losskd_loss = torch.tensor(0.0, device=log_probs.device)
 
         # layerwise distillation loss
         layer_loss = torch.tensor(0.0, device=log_probs.device)
@@ -302,7 +312,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # 종합 loss
         loss = ctc_loss \
-             + (self.kd_alpha * kd_loss if self.use_logit_distillation else 0.0) \
+             + (self.kd_alpha * logit_kd_loss if self.use_logit_distillation else 0.0) \
              + (self.layer_kd_alpha * layer_loss if self.use_layerwise_distillation else 0.0)
 
 
@@ -341,6 +351,15 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         if use_flow_matching:
             assert flow_cfg is not None
             self.flow_matching = FlowMatchingModule(flow_cfg)
+        self.stu_feats = []
+        self.tch_feats = []
+        if self.use_layerwise_distillation:
+            for layer in self.encoder.layers:
+                layer.register_forward_hook(self._capture_stu_feat)
+    
+    def _capture_stu_feat(self, module, input, output):
+        # output: Tensor [B, H, T]
+        self.stu_feats.append(output)
 
     def _init_layer_proj(self, stu_feat, tch_feat):
         H_s = stu_feat.size(1)
@@ -369,6 +388,11 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
             3) The greedy token predictions of the model of shape [B, T] (via argmax)
         """
+        # ————— layerwise KD용 버퍼 초기화 —————
+        if self.use_layerwise_distillation:
+            self.stu_feats.clear()
+            self.tch_feats.clear()
+        
         # preprocess
         has_input = input_signal is not None and input_signal_length is not None
         has_processed = processed_signal is not None and processed_signal_length is not None
@@ -406,6 +430,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             return log_probs, encoded_len, greedy_preds
     
     def training_step(self, batch, batch_idx):
+        # layerwise KD용 teacher buffer 초기화
+        if self.use_layerwise_distillation:
+            self.tch_feats.clear()
+        
         signal, sig_len, transcript, transcript_len = batch
 
         # 1) Student: preprocess + encode 한 번
@@ -448,36 +476,42 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         if self.use_logit_distillation:
             stu_logp = F.log_softmax(log_probs / self.temperature, dim=-1)
             tch_p    = F.softmax(tch_logp   / self.temperature, dim=-1)
-            kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") \
+            logit_kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") \
                        * (self.temperature ** 2)
         else:
-            kd_loss = torch.tensor(0.0, device=log_probs.device)
+            logit_kd_loss = torch.tensor(0.0, device=log_probs.device)
 
         # 7) Layerwise distillation (student feature vs. teacher feature)
+        layer_kd_loss = torch.tensor(0.0, device=log_probs.device)
         if self.use_layerwise_distillation:
-            # stu_feat: 원래 encoder 출력 (before flow)
-            B, H_s, T_s = stu_feat.size()
-            if getattr(self, 'layer_proj', None) is None:
-                self._init_layer_proj(stu_feat, tch_feat)
-            stu_flat  = stu_feat.transpose(1,2).reshape(-1, H_s)
-            proj_flat = self.layer_proj(stu_flat)
-            stu_proj  = proj_flat.reshape(B, T_s, -1).transpose(1,2)
-            layer_loss = F.mse_loss(stu_proj, tch_feat)
-        else:
-            layer_loss = torch.tensor(0.0, device=signal.device)
+            for i, (s, t) in enumerate(zip(self.stu_feats, self.tch_feats)):
+                B, Hs, T = s.size()
+                Ht = t.size(1)
+                proj_name = f'layer_proj_{i}'
+                if not hasattr(self, proj_name):
+                    setattr(self, proj_name, nn.Linear(Hs, Ht).to(s.device))
+                # (B, Hs, T) → (B*T, Hs)
+                s_flat = s.transpose(1,2).reshape(-1, Hs)
+                # project → (B*T, Ht) → (B, Ht, T)
+                p_flat = getattr(self, proj_name)(s_flat)
+                s_proj = p_flat.reshape(B, T, Ht).transpose(1,2)
+                layer_loss = F.mse_loss(s_proj, t)
+                layer_kd_loss += layer_loss
+            layer_kd_loss /= len(self.stu_feats)  # 평균화
+            self.tch_feats.clear()
 
         # 8) Total loss & logging
         total_loss = (
             ctc_loss
-            + (self.kd_alpha * kd_loss if self.use_logit_distillation else 0.0)
-            + (self.layer_kd_alpha * layer_loss if self.use_layerwise_distillation else 0.0)
+            + (self.kd_alpha * logit_kd_loss if self.use_logit_distillation else 0.0)
+            + (self.layer_kd_alpha * layer_kd_loss if self.use_layerwise_distillation else 0.0)
             + flow_loss
         )
         self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
         if self.use_logit_distillation:
-            self.log("train_kd_loss", kd_loss, on_step=True, on_epoch=True)
+            self.log("train_logit_kd_loss", logit_kd_loss, on_step=True, on_epoch=True)
         if self.use_layerwise_distillation:
-            self.log("train_layer_kd_loss", layer_loss, on_step=True, on_epoch=True)
+            self.log("train_layer_kd_loss", layer_kd_loss, on_step=True, on_epoch=True)
         if self.use_flow_matching:
             self.log("train_flow_matching_loss", flow_loss, on_step=True, on_epoch=True)
         self.log("train_loss", total_loss, on_step=True, on_epoch=True)
@@ -763,7 +797,7 @@ class FlowMatchingModule(nn.Module):
             # Conformer 기반 flow 네트워크
             self.meta_encoder = ConformerEncoder(
                 input_dim=self.feature_dim + time_embed_dim,
-                encoder_dim=hidden_dim,
+                encoder_dim=self.feature_dim,
                 num_heads=self.student_head_num,
                 ff_mult=4,
                 conv_expansion_factor=2,
@@ -822,7 +856,7 @@ class FlowMatchingModule(nn.Module):
             t = torch.full((s_f.size(0), 1, s_f.size(2)), i / sampling_steps, device=s_f.device)
             t = t.permute(0, 2, 1)
             embed_t = self.time_embed(t)
-            if self.meta_encoder_type == "mlp":
+            if self.meta_encoder_type == "mlp" or self.meta_encoder_type == "conformer":
                 x_perm = x.permute(0, 2, 1)
                 embed_x = torch.cat([x_perm, embed_t], dim=-1)
                 velocity = self.meta_encoder(embed_x)
@@ -911,19 +945,19 @@ def main():
     )
     parser.add_argument(
         "--train_teacher_model",
-        type=bool,
+        type=str2bool,
         default=False,
         help="True: teacher 모델 학습, False: student 모델 학습",
     )
     parser.add_argument(
         "--use_ctc",
-        type=bool,
+        type=str2bool,
         default=True,
         help="CTC loss 사용 여부 (True: CTC, False: CrossEntropy)"
     )
     parser.add_argument(
         "--use_logit_distillation",
-        type=bool,
+        type=str2bool,
         default=False,
         help="CTC loss 외에 teacher logits 와의 KL-divergence loss 를 추가"
     )
@@ -941,7 +975,7 @@ def main():
     )
     parser.add_argument(
         "--use_layerwise_distillation", 
-        type=bool, 
+        type=str2bool, 
         default=False,
         help="레이어 단위 KD 실행 여부"
     )
@@ -953,7 +987,7 @@ def main():
     )
     parser.add_argument(
         "--use_flow_matching",
-        type=bool,
+        type=str2bool,
         default=False,
         help="Flow Matching 기법 사용 여부"
     )
@@ -995,7 +1029,6 @@ def main():
         help="Flow Matching 시 사용되는 메타 인코더 architecture"
     )
     args = parser.parse_args()
-
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
     shutil.copy(__file__, os.path.join(args.output_dir, os.path.basename(__file__)))
