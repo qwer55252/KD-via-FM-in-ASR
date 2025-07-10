@@ -178,3 +178,5 @@ lightning_logs/
 *.tar.gz
 data/
 outputs/
+NeMo/.github
+NeMo/.git
