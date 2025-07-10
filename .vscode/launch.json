@@ -1,33 +1,52 @@
-// .vscode/launch.json
 {
+  // VSCode Launch Configuration for FlowMatching_KD training
   "version": "0.2.0",
   "configurations": [
+    // {
+    //   "name": "Python: ASR Inference",
+    //   "type": "debugpy",
+    //   "request": "launch",
+    //   "program": "${workspaceFolder}/asr_inference.py",
+    //   "console": "integratedTerminal",
+    //   "args": [
+    //     "--ckpt_path", "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/only_flow_sampling4/checkpoints/last.ckpt",
+    //     "--meta_encoder_type", "mlp",
+    //     "--flow_steps", "4",
+    //     "--flow_schedule", "rectified",
+    //     "--flow_weight", "1.0"
+    //   ]
+    // },
     {
-      "name": "Train Distil CTC with Layer KD",
+      "name": "Python: Train FlowMatching_KD",
       "type": "debugpy",
       "request": "launch",
-
       "program": "${workspaceFolder}/asr_train.py",
       "console": "integratedTerminal",
-      // cwd도 마찬가지로 이 launch.json 파일이 있는 폴더로
-      "cwd": "${workspaceFolder}",
       "env": {
-        "HF_DATASETS_CACHE": "/root/.cache/huggingface/datasets"
+        "HF_DATASETS_CACHE": "/root/.cache/huggingface/datasets",
+        "PRJ_NAME": "FlowMatching_KD",
+        "EXP_NAME": "flowkd_mlp_linear_sampling8_testmode",
+        "OUTPUT_DIR": "${workspaceFolder}/outputs/${env:PRJ_NAME}/${env:EXP_NAME}"
       },
       "args": [
-        "--output_dir", "${workspaceFolder}/outputs/LayerKD_CTCLoss/layeralpha01",
+        "--output_dir", "${workspaceFolder}/outputs/FlowMatching_KD/flowkd_mlp_linear_sampling8_testmode",
         "--data_config_name", "train_100",
         "--data_train_split", "train.clean.100",
         "--data_val_split", "dev.clean",
         "--data_test_split", "test.clean",
         "--batch_size", "32",
-        "--epochs", "1",
-        "--logit_distillation", "True",
+        "--epochs", "100",
+        "--use_ctc", "True",
+        "--use_logit_distillation", "True",
+        "--use_layerwise_distillation", "False",
+        "--use_flow_matching", "True",
         "--kd_temperature", "1",
         "--kd_alpha", "0.1",
-        "--layerwise_distillation", "True",
-        "--layer_kd_alpha", "0.1"
-      ]
+        "--layer_kd_alpha", "1.0",
+        "--flow_steps", "8",
+        "--test_mode"
+      ],
+      "justMyCode": true
     }
   ]
 }

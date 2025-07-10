@@ -1,0 +1,7 @@
+{
+  "python.analysis.extraPaths": [
+    "/workspace/KD-via-FM-in-ASR/NeMo",
+  ],
+  "python.analysis.useLibraryCodeForTypes": true,
+  "python.analysis.indexing": true
+}
