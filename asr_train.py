@@ -346,25 +346,24 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.layer_kd_alpha = layer_kd_alpha
         self.use_flow_matching = use_flow_matching
         # Lazy init for layer projection
-        self.layer_proj = None
-        # FlowMatchingModule
+        
+        self.flow_matching = None
         if use_flow_matching:
             assert flow_cfg is not None
             self.flow_matching = FlowMatchingModule(flow_cfg)
+        
+        self.layer_proj = None
         self.stu_feats = []
         self.tch_feats = []
         if self.use_layerwise_distillation:
+            self.layer_proj = nn.Linear(flow_cfg["student_dim"], flow_cfg["teacher_dim"])
             for layer in self.encoder.layers:
                 layer.register_forward_hook(self._capture_stu_feat)
+            
     
     def _capture_stu_feat(self, module, input, output):
         # output: Tensor [B, H, T]
         self.stu_feats.append(output)
-
-    def _init_layer_proj(self, stu_feat, tch_feat):
-        H_s = stu_feat.size(1)
-        H_t = tch_feat.size(1)
-        self.layer_proj = nn.Linear(H_s, H_t).to(stu_feat.device)
 
     def forward(self, input_signal=None, input_signal_length=None, 
                 processed_signal=None, processed_signal_length=None):
@@ -487,13 +486,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             for i, (s, t) in enumerate(zip(self.stu_feats, self.tch_feats)):
                 B, Hs, T = s.size()
                 Ht = t.size(1)
-                proj_name = f'layer_proj_{i}'
-                if not hasattr(self, proj_name):
-                    setattr(self, proj_name, nn.Linear(Hs, Ht).to(s.device))
                 # (B, Hs, T) → (B*T, Hs)
                 s_flat = s.transpose(1,2).reshape(-1, Hs)
                 # project → (B*T, Ht) → (B, Ht, T)
-                p_flat = getattr(self, proj_name)(s_flat)
+                p_flat = self.layer_proj(s_flat)
                 s_proj = p_flat.reshape(B, T, Ht).transpose(1,2)
                 layer_loss = F.mse_loss(s_proj, t)
                 layer_kd_loss += layer_loss
@@ -778,6 +774,7 @@ class FlowMatchingModule(nn.Module):
         self.time_embed = nn.Linear(1, time_embed_dim)
 
         # meta_encoder 자동 생성
+        self.meta_encoder = None
         if self.meta_encoder_type == "mlp":
             self.meta_encoder = nn.Sequential(
                 nn.Linear(self.feature_dim + time_embed_dim, hidden_dim),
@@ -815,6 +812,7 @@ class FlowMatchingModule(nn.Module):
             raise ValueError(f"Unknown meta_encoder type: {self.meta_encoder_type}")
 
         # shape_transformation_function 선택
+        self.shape_transformation_function = None
         shape_transform = flow_cfg.get("shape_transform", "linear")
         self.shape_transform_type = shape_transform
         if shape_transform == "identity":
@@ -836,6 +834,7 @@ class FlowMatchingModule(nn.Module):
             raise ValueError(f"Unknown loss type: {loss_type}")
 
         # noise schedule
+        self.noise_schedule = None
         noise_schedule = flow_cfg.get("noise_schedule", "rectified")
         if noise_schedule == "rectified":
             self.noise_schedule = rectified_flow_schedule
@@ -1028,6 +1027,13 @@ def main():
         choices=["mlp", "cnn", "swin", "conformer", "unet"],
         help="Flow Matching 시 사용되는 메타 인코더 architecture"
     )
+    parser.add_argument(
+        "--shape_transform_type",
+        type=str,
+        default="linear",
+        choices=["identity", "linear", "conv1d"],
+        help="Flow Matching 시 student feature → teacher feature 변환 방식"
+    )
     args = parser.parse_args()
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1127,6 +1133,12 @@ def main():
     wandb_logger = WandbLogger(project=prj_name, name=exp_name, save_dir=args.output_dir)
     last_ckpt_dir = os.path.join(args.output_dir, "checkpoints")
     last_ckpt_path = os.path.join(last_ckpt_dir, "last.ckpt")
+    if os.path.exists(last_ckpt_path):
+        pattern = os.path.join(last_ckpt_dir, "last-v*.ckpt")
+        existing_files = glob.glob(pattern)
+        sub_ckpt_path = os.path.join(last_ckpt_dir, f"last-v{len(existing_files)+1}.ckpt")
+        os.rename(last_ckpt_path, sub_ckpt_path)
+        
     checkpoint_callback = ModelCheckpoint(
         dirpath=last_ckpt_dir,
         filename="last",
@@ -1185,7 +1197,7 @@ def main():
                     "weight": args.flow_weight,
                     "noise_schedule": args.flow_schedule,  # "rectified", "vp_ode", "ve_ode"
                     "loss": "mse",  # or "cosine"
-                    "shape_transform": "linear",  # or "linear", "conv1d" 등
+                    "shape_transform": args.shape_transform_type,  # or "linear", "conv1d" 등
                     "student_dim": model_cfg.encoder.d_model,  # student 모델의 feature dim
                     "teacher_dim": teacher_model.cfg.encoder.d_model,  # teacher 모델의 feature dim
                     "student_head_num": model_cfg.encoder.n_heads,  # student 모델의 head 수

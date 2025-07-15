@@ -14,6 +14,15 @@ from asr_train import (
     make_student_config,
     DistilFlowMatchingCTCModelBPE,
 )
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = v.lower()
+    if v in ("yes", "true", "t", "y", "1"):
+        return True
+    if v in ("no",  "false","f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -60,6 +69,30 @@ def parse_args():
     parser.add_argument(
         "--flow_weight", type=float, default=1.0,
         help="flow-matching loss 가중치 (학습과 동일하게)"
+    )
+    parser.add_argument(
+        "--use_ctc",
+        type=str2bool,
+        default=False,
+        help="CTC loss 사용 여부 (True: CTC, False: CrossEntropy)"
+    )
+    parser.add_argument(
+        "--use_logit_distillation",
+        type=str2bool,
+        default=False,
+        help="CTC loss 외에 teacher logits 와의 KL-divergence loss 를 추가"
+    )
+    parser.add_argument(
+        "--use_layerwise_distillation", 
+        type=str2bool, 
+        default=False,
+        help="레이어 단위 KD 실행 여부"
+    )
+    parser.add_argument(
+        "--use_flow_matching",
+        type=str2bool,
+        default=False,
+        help="Flow Matching 기법 사용 여부"
     )
     parser.add_argument("--data_sample_rate", type=int, default=16000, help="샘플링 주파수")
     return parser.parse_args()
@@ -117,13 +150,13 @@ def main():
         cfg=student_cfg,
         trainer=trainer,
         teacher_model=teacher,
-        use_ctc=False,
-        use_logit_distillation=False,
+        use_ctc=args.use_ctc,
+        use_logit_distillation=args.use_logit_distillation,
         kd_alpha=0.1,
         kd_temperature=1.0,
-        use_layerwise_distillation=False,
+        use_layerwise_distillation=args.use_layerwise_distillation,
         layer_kd_alpha=1.0,
-        use_flow_matching=True,
+        use_flow_matching=args.use_flow_matching,
         flow_cfg=flow_cfg,
     )
     model.eval()
@@ -131,10 +164,10 @@ def main():
     # (2) 체크포인트 로드
     ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False,)
     state = ckpt["state_dict"]
-    # layer_proj.* 키만 사전에서 제거
-    for k in list(state.keys()):
-        if k.startswith("layer_proj."):
-            state.pop(k)
+    # # layer_proj.* 키만 사전에서 제거
+    # for k in list(state.keys()):
+    #     if k.startswith("layer_proj."):
+    #         state.pop(k)
     model.load_state_dict(state, strict=False)
     # model.to("cuda:0")  # 필요하다면
 
@@ -149,6 +182,7 @@ def main():
         extract_compressed_file=True,
         delete_extracted=False,
     )
+    all_metrics = {}
     for split in split_names:
         print(f"\n===== Evaluating split: {split} =====")
         ds = load_dataset(
@@ -179,6 +213,11 @@ def main():
         wer  = res.get("test_wer", res.get("wer", None))
         loss = res.get("test_loss", res.get("loss", None))
         print(f"→ {split} | loss = {loss:.4f} | WER = {wer:.2%}")
+        
+        all_metrics[split] = {"loss": loss, "wer": wer}
+    print("\n===== Final Summary =====")
+    for split, m in all_metrics.items():
+        print(f"{split:10s} → Loss: {m['loss']:.4f}, WER: {m['wer']:.2%}")
 
 if __name__ == "__main__":
     main()
