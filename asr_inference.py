@@ -94,6 +94,18 @@ def parse_args():
         default=False,
         help="Flow Matching 기법 사용 여부"
     )
+    parser.add_argument(
+        "--kd_temperature", type=float, default=1.0,
+        help="Knowledge Distillation 온도 (logit distillation 시)"
+    )
+    parser.add_argument(
+        "--kd_alpha", type=float, default=0.1,
+        help="Knowledge Distillation 가중치 (logit distillation 시)"
+    )
+    parser.add_argument(
+        "--layer_kd_alpha", type=float, default=1.0,
+        help="레이어 단위 Knowledge Distillation 가중치"
+    )
     parser.add_argument("--data_sample_rate", type=int, default=16000, help="샘플링 주파수")
     return parser.parse_args()
 
