@@ -1,8 +1,9 @@
 export HF_DATASETS_CACHE="/root/.cache/huggingface/datasets"
-export EXP_NAME="LayerKD_CTCLoss"
+export PRJ_NAME="FlowMatching_KD"
+export EXP_NAME="LayerKD_alpha1"
 
 # 1) 출력 디렉토리 생성
-OUTPUT_DIR="./outputs/$EXP_NAME/layeralpha2"
+OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
 mkdir -p "$OUTPUT_DIR"
 
 # 2) 학습 실행 및 로그 저장
@@ -14,9 +15,11 @@ python asr_train.py \
 --data_test_split test.clean \
 --batch_size 32 \
 --epochs 100 \
---logit_distillation True \
+--use_ctc True \
+--use_logit_distillation True \
+--use_layerwise_distillation True \
+--use_flow_matching False \
 --kd_temperature 1 \
 --kd_alpha 0.1 \
---layerwise_distillation True \
 --layer_kd_alpha 2.0
 # > "$OUTPUT_DIR/output_log.txt" 2>&1
