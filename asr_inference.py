@@ -218,7 +218,7 @@ def main():
         results = trainer.test(
             model=model,
             dataloaders=[dl],
-            ckpt_path=args.ckpt_path,
+            # ckpt_path=args.ckpt_path,
             verbose=False,
         )
         res  = results[0]
