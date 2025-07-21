@@ -355,15 +355,18 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.layer_proj = None
         self.stu_feats = []
         self.tch_feats = []
-        if self.use_layerwise_distillation:
+        if self.use_layerwise_distillation or self.use_flow_matching:
             self.layer_proj = nn.Linear(flow_cfg["student_dim"], flow_cfg["teacher_dim"])
             for layer in self.encoder.layers:
                 layer.register_forward_hook(self._capture_stu_feat)
+            for layer in self.teacher.encoder.layers:
+                layer.register_forward_hook(self._capture_tch_feat)
             
     
-    def _capture_stu_feat(self, module, input, output):
-        # output: Tensor [B, H, T]
+    def _capture_stu_feat(self, module, input, output): # output: Tensor [B, H, T]
         self.stu_feats.append(output)
+    def _capture_tch_feat(self, module, input, output):
+        self.tch_feats.append(output)
 
     def forward(self, input_signal=None, input_signal_length=None, 
                 processed_signal=None, processed_signal_length=None):
@@ -388,7 +391,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             3) The greedy token predictions of the model of shape [B, T] (via argmax)
         """
         # ————— layerwise KD용 버퍼 초기화 —————
-        if self.use_layerwise_distillation:
+        if self.use_layerwise_distillation or self.use_flow_matching:
             self.stu_feats.clear()
             self.tch_feats.clear()
         
@@ -410,33 +413,45 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # encoder_out.shape : torch.Size([32, 88, 179])
         # prepare teacher feature for training
         tch_feat = None
-        if self.use_flow_matching and self.training:
+        # if self.use_flow_matching and self.training:
+        if self.use_flow_matching:
             with torch.no_grad():
                 proc_t, len_t = self.teacher.preprocessor(input_signal=input_signal, length=input_signal_length)
                 tch_feat, _ = self.teacher.encoder(audio_signal=proc_t, length=len_t)
         # flow matching (training & inference)
+        total_flow_loss = torch.tensor(0.0, device=encoder_out.device)
         if self.use_flow_matching:
-            flow_loss, encoder_out = self.flow_matching(encoder_out, tch_feat)
-            # encoder_out.shape : torch.Size([32, 176, 179])
-        else:
-            flow_loss = torch.tensor(0.0, device=encoder_out.device)
+            for i, (stu_feat, tch_feat) in enumerate(zip(self.stu_feats, self.tch_feats)):
+                flow_loss, fm_encoder_out = self.flow_matching(stu_feat, tch_feat) # stu_feat=[32, 179, 88], tch_feat=[32, 179, 176]
+                total_flow_loss += flow_loss
+                # print(f'i: {i}, flow_loss: {flow_loss}')
+            # print(f"Total flow matching loss: {total_flow_loss.item()}")
+            # loss logging
+            self.log("train_flow_matching_loss", total_flow_loss, prog_bar=False, on_step=True, on_epoch=True)
+            # flow matching 결과 fm_encoder_out: (B, T, C) 
+            # → decoder가 기대하는 (B, C, T) 순으로 non-inplace 변환
+            encoder_out = fm_encoder_out.transpose(1, 2) # TODO: 이거 있는게 나은지 없는게 나은지 실험해보자 -> kobie-175에서    (일단은 있이 ㄱㄱ)
         # decode: positional → kwargs 수정
+        
+        # encoder_out.shape : torch.Size([batch, 88, seq_len]) 이어야 함
         log_probs = self.decoder(encoder_output=encoder_out)
         greedy_preds = log_probs.argmax(dim=-1, keepdim=False)
         if self.training:
-            return log_probs, encoded_len, greedy_preds, flow_loss, encoder_out
+            return log_probs, encoded_len, greedy_preds, total_flow_loss, encoder_out
         else:
             return log_probs, encoded_len, greedy_preds
     
     def training_step(self, batch, batch_idx):
         # layerwise KD용 teacher buffer 초기화
         if self.use_layerwise_distillation:
+            self.stu_feats.clear()
             self.tch_feats.clear()
         
         signal, sig_len, transcript, transcript_len = batch
 
+        '''
         # 1) Student: preprocess + encode 한 번
-        proc_s, len_s = self.preprocessor(input_signal=signal, length=sig_len)
+        proc_s, len_s = self.preprocessor(input_signal=signal, length=sig_len)ㅋ
         stu_feat, encoded_len = self.encoder(audio_signal=proc_s, length=len_s)
 
         # 2) Teacher: preprocess+encode 한 번, decoder 한 번 (no grad)
@@ -459,6 +474,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # 4) Decode student once (with matched features)
         log_probs = self.decoder(encoder_output=encoder_out)
         greedy_preds = log_probs.argmax(dim=-1)
+        '''
+        log_probs, encoded_len, greedy_preds, total_flow_loss, encoder_out = self.forward(input_signal=signal, input_signal_length=sig_len)
 
         # 5) CTC loss
         if self.use_ctc:
@@ -473,8 +490,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # 6) Logit distillation (KL-divergence)
         if self.use_logit_distillation:
+            with torch.no_grad():
+                tch_logp = self.teacher.decoder(encoder_output=self.tch_feats[-1].permute(0, 2, 1))
+                tch_p = F.softmax(tch_logp   / self.temperature, dim=-1)
             stu_logp = F.log_softmax(log_probs / self.temperature, dim=-1)
-            tch_p    = F.softmax(tch_logp   / self.temperature, dim=-1)
             logit_kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") \
                        * (self.temperature ** 2)
         else:
@@ -501,7 +520,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             ctc_loss
             + (self.kd_alpha * logit_kd_loss if self.use_logit_distillation else 0.0)
             + (self.layer_kd_alpha * layer_kd_loss if self.use_layerwise_distillation else 0.0)
-            + flow_loss
+            + total_flow_loss
         )
         self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
         if self.use_logit_distillation:
@@ -509,7 +528,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         if self.use_layerwise_distillation:
             self.log("train_layer_kd_loss", layer_kd_loss, on_step=True, on_epoch=True)
         if self.use_flow_matching:
-            self.log("train_flow_matching_loss", flow_loss, on_step=True, on_epoch=True)
+            self.log("train_flow_matching_loss", total_flow_loss, on_step=True, on_epoch=True)
         self.log("train_loss", total_loss, on_step=True, on_epoch=True)
 
         return total_loss
@@ -778,6 +797,7 @@ class FlowMatchingModule(nn.Module):
         if self.meta_encoder_type == "mlp":
             self.meta_encoder = nn.Sequential(
                 nn.Linear(self.feature_dim + time_embed_dim, hidden_dim),
+                # nn.Linear(self.feature_dim, hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, self.feature_dim)
             )
@@ -852,14 +872,25 @@ class FlowMatchingModule(nn.Module):
         sampling_steps = self.training_sampling if self.training else (inference_sampling or self.inference_sampling)
         x = s_f
         for i in reversed(range(1, sampling_steps + 1)):
-            t = torch.full((s_f.size(0), 1, s_f.size(2)), i / sampling_steps, device=s_f.device)
-            t = t.permute(0, 2, 1)
+            # s_f.shape: (32, 179, 88)
+            t = torch.full((s_f.size(0), s_f.size(1), 1), i / sampling_steps, device=s_f.device)
+            # t.shape: (32, 179, 1)
             embed_t = self.time_embed(t)
+            # embed_t.shape: (32, 179, 32)
+            embed_t = embed_t.permute(0, 2, 1)
+            # embed_t.shape: (32, 32, 179)
             if self.meta_encoder_type == "mlp" or self.meta_encoder_type == "conformer":
                 x_perm = x.permute(0, 2, 1)
-                embed_x = torch.cat([x_perm, embed_t], dim=-1)
+                # x_perm.shape: (batch, 88, 179)
+                # embed_t.shape: (batch, 32, 179)
+                embed_x = torch.cat([x_perm, embed_t], dim=1)
+                # embed_x.shape: (batch, 120, 179)
+                embed_x = embed_x.permute(0, 2, 1)
+                # embed_x.shape: (32, 179, 120)
                 velocity = self.meta_encoder(embed_x)
-                velocity = velocity.permute(0, 2, 1)
+                # velocity.shape: (32, 179, 88)
+                # velocity = velocity.permute(0, 2, 1)
+                # velocity.shape: (32, 88, 179)
             else:
                 embed_t_perm = embed_t.permute(0, 2, 1)
                 embed_x = torch.cat([x, embed_t_perm], dim=1)
@@ -877,15 +908,16 @@ class FlowMatchingModule(nn.Module):
                         # 너무 짧으면 뒤쪽에 0 패딩
                         pad_amt = T_x - T_v
                         velocity = F.pad(velocity, (0, pad_amt))
+            # x: (batch, seq_len, Hs), velocity: (batch, seq_len, Hs)
             x = x - velocity / sampling_steps
         loss = 0.0
         if self.training and t_f is not None:
-            t = t.permute(0, 2, 1)
+            # t = t.permute(0, 2, 1)
             dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t)
             noise_scheduled_x = (dalpha_dt * s_f - velocity) / (-dsigma_dt)
             if self.shape_transform_type == "linear":
-                noise_scheduled_x = noise_scheduled_x.permute(0, 2, 1)
-                transformed_s_f = self.shape_transformation_function(noise_scheduled_x).permute(0, 2, 1)
+                # noise_scheduled_x = noise_scheduled_x.permute(0, 2, 1)
+                transformed_s_f = self.shape_transformation_function(noise_scheduled_x)
             else:
                 transformed_s_f = self.shape_transformation_function(noise_scheduled_x)
             loss = self.metric_based_loss_function(transformed_s_f, t_f)
@@ -1163,6 +1195,9 @@ def main():
         map_location="cuda:0",
         trainer=trainer,
     )
+    teacher_model.eval()
+    for p in teacher_model.parameters():
+        p.requires_grad = False
     
     # 파이썬에서 Nemo API로 풀어두는 함수 실행
     release_nemoAPI(teacher_model)
