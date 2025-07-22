@@ -889,12 +889,14 @@ class FlowMatchingModule(nn.Module):
                 # embed_x.shape: (32, 179, 120)
                 velocity = self.meta_encoder(embed_x)
                 # velocity.shape: (32, 179, 88)
-                # velocity = velocity.permute(0, 2, 1)
-                # velocity.shape: (32, 88, 179)
             else:
-                embed_t_perm = embed_t.permute(0, 2, 1)
-                embed_x = torch.cat([x, embed_t_perm], dim=1)
+                x_perm = x.permute(0, 2, 1)
+                embed_x = torch.cat([x_perm, embed_t], dim=1)
+                # embed_x.shape: (batch, 120, 179)
                 velocity = self.meta_encoder(embed_x)
+                # velocity.shape: (32, 88, 179)
+                velocity = velocity.permute(0, 2, 1)
+                # velocity.shape: (32, 179, 88)
             
             if self.meta_encoder_type == "unet":
                 # time-dim 이 x 와 다를 때, crop 또는 pad 로 맞춰주기
