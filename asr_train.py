@@ -345,11 +345,15 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.use_layerwise_distillation = use_layerwise_distillation
         self.layer_kd_alpha = layer_kd_alpha
         self.use_flow_matching = use_flow_matching
+        self.layer_sampling_steps = None
         # Lazy init for layer projection
         
         self.flow_matching = None
         if use_flow_matching:
             assert flow_cfg is not None
+            self.sampling_steps_per_layer = flow_cfg.get("sampling_steps_per_layer", None)
+            assert self.sampling_steps_per_layer is None or len(self.sampling_steps_per_layer) == len(self.encoder.layers), \
+                "sampling_steps_per_layer 길이는 encoder.layers 수와 같아야 합니다."
             self.flow_matching = FlowMatchingModule(flow_cfg)
         
         self.layer_proj = None
@@ -357,6 +361,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.tch_feats = []
         if self.use_layerwise_distillation or self.use_flow_matching:
             self.layer_proj = nn.Linear(flow_cfg["student_dim"], flow_cfg["teacher_dim"])
+            assert len(self.teacher.encoder.layers) == len(self.encoder.layers), \
+                "student 모델과 teacher 모델의 layer 수가 같아야 합니다."
             for layer in self.encoder.layers:
                 layer.register_forward_hook(self._capture_stu_feat)
             for layer in self.teacher.encoder.layers:
@@ -422,7 +428,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         total_flow_loss = torch.tensor(0.0, device=encoder_out.device)
         if self.use_flow_matching:
             for i, (stu_feat, tch_feat) in enumerate(zip(self.stu_feats, self.tch_feats)):
-                flow_loss, fm_encoder_out = self.flow_matching(stu_feat, tch_feat) # stu_feat=[32, 179, 88], tch_feat=[32, 179, 176]
+                layer_sampling_steps = None
+                if self.sampling_steps_per_layer:
+                    layer_sampling_steps = self.sampling_steps_per_layer[i]
+                flow_loss, fm_encoder_out = self.flow_matching(stu_feat, tch_feat, layer_sampling_steps=layer_sampling_steps) # stu_feat=[32, 179, 88], tch_feat=[32, 179, 176]
                 total_flow_loss += flow_loss
                 # print(f'i: {i}, flow_loss: {flow_loss}')
             # print(f"Total flow matching loss: {total_flow_loss.item()}")
@@ -868,10 +877,13 @@ class FlowMatchingModule(nn.Module):
         else:
             raise NotImplementedError
 
-    def forward(self, s_f, t_f=None, target=None, inference_sampling: int = None):
-        sampling_steps = self.training_sampling if self.training else (inference_sampling or self.inference_sampling)
+    def forward(self, s_f, t_f=None, target=None, layer_sampling_steps: int = None):
+        # sampling_steps = sampling_steps or (self.training_sampling if self.training else self.inference_sampling)
+        sampling_steps = self.training_sampling if self.training else self.inference_sampling
+        stride = self.training_sampling // layer_sampling_steps if layer_sampling_steps else 1
+        stride *= -1
         x = s_f
-        for i in reversed(range(1, sampling_steps + 1)):
+        for i in range(sampling_steps, 0, stride):
             # s_f.shape: (32, 179, 88)
             t = torch.full((s_f.size(0), s_f.size(1), 1), i / sampling_steps, device=s_f.device)
             # t.shape: (32, 179, 1)
@@ -1068,6 +1080,13 @@ def main():
         choices=["identity", "linear", "conv1d"],
         help="Flow Matching 시 student feature → teacher feature 변환 방식"
     )
+    parser.add_argument(
+        "--sampling_steps_per_layer",
+        type=lambda s: json.loads(s),   # 또는: lambda s: ast.literal_eval(s)
+        default=None,
+        help="각 레이어별로 Flow Matching 시 사용하는 샘플링 단계 수 (e.g. \"[1,1,2,2]\")"
+    )
+        
     args = parser.parse_args()
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1239,6 +1258,7 @@ def main():
                     "teacher_dim": teacher_model.cfg.encoder.d_model,  # teacher 모델의 feature dim
                     "student_head_num": model_cfg.encoder.n_heads,  # student 모델의 head 수
                     "teacher_head_num": teacher_model.cfg.encoder.n_heads,  # teacher 모델의 head
+                    "sampling_steps_per_layer": args.sampling_steps_per_layer,
                     # 필요하다면 cnn일 경우 in_ch, out_ch 등 추가
                 }
             model = DistilFlowMatchingCTCModelBPE(
