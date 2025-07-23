@@ -923,7 +923,10 @@ class FlowMatchingModule(nn.Module):
                         pad_amt = T_x - T_v
                         velocity = F.pad(velocity, (0, pad_amt))
             # x: (batch, seq_len, Hs), velocity: (batch, seq_len, Hs)
-            x = x - velocity / sampling_steps
+            if layer_sampling_steps:
+                x = x - velocity / layer_sampling_steps
+            else:
+                x = x - velocity / sampling_steps
         loss = 0.0
         if self.training and t_f is not None:
             # t = t.permute(0, 2, 1)
@@ -1086,7 +1089,12 @@ def main():
         default=None,
         help="각 레이어별로 Flow Matching 시 사용하는 샘플링 단계 수 (e.g. \"[1,1,2,2]\")"
     )
-        
+    parser.add_argument(
+        "--resume_ckpt",
+        type=str,
+        default=None,
+        help="학습 재개할 체크포인트(.ckpt) 파일 경로"
+    )    
     args = parser.parse_args()
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1292,7 +1300,7 @@ def main():
 
 
     # 8) 학습 시작
-    trainer.fit(model)
+    trainer.fit(model, ckpt_path=args.resume_ckpt)
         
     # 9) Best checkpoint 로드 후 .nemo로 저장
     # last_ckpt_path = os.path.join(args.output_dir, "checkpoint", "last_ckpt.ckpt")
