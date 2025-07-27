@@ -166,6 +166,76 @@ def str2bool(v):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
 
+class DiffKDModule(nn.Module):
+    """
+    DiffKD: teacher feature를 선형 오토인코더로 잠재 공간으로 압축,
+    student feature를 같은 잠재 공간으로 프로젝션한 뒤
+    반복적 디노이저로 노이즈 제거 → 최종 디노이즈된 student latent와
+    teacher latent 간 MSE 손실을 계산.
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        # 파라미터
+        self.steps       = cfg.get("steps", 5)
+        self.teacher_dim = cfg["teacher_dim"]
+        self.student_dim = cfg["student_dim"]
+        # 잠재 차원 (원하면 cfg로 따로 지정 가능)
+        self.latent_dim  = cfg.get("latent_dim", min(self.teacher_dim, self.student_dim))
+        
+        # 1) Linear Autoencoder (채널 차원 압축 & 재구성)
+        #   - encoder: (B, teacher_dim, T) → (B, latent_dim, T)
+        #   - decoder: (B, latent_dim, T) → (B, teacher_dim, T)
+        self.encoder = nn.Conv1d(self.teacher_dim, self.latent_dim, kernel_size=1)
+        self.decoder = nn.Conv1d(self.latent_dim, self.teacher_dim, kernel_size=1)
+        
+        # 2) Student → latent 프로젝션
+        #   (B, student_dim, T) → (B, latent_dim, T)
+        self.proj    = nn.Conv1d(self.student_dim, self.latent_dim, kernel_size=1)
+        
+        # 3) 디노이저 네트워크 (간단한 1D CNN 블록)
+        self.denoiser = nn.Sequential(
+            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
+        )
+        
+        # 4) 손실 함수
+        self.recon_loss   = nn.MSELoss()
+        self.distill_loss = nn.MSELoss()
+
+    def forward(self, stu_feat, tch_feat, sampling_steps=None):
+        """
+        Args:
+          stu_feat: Tensor [B, T, student_dim]
+          tch_feat: Tensor [B, T, teacher_dim]
+
+        Returns:
+          diffkd_loss: scalar tensor = AE loss + distill loss
+        """
+        # --- (1) Teacher feature 압축 & 재구성으로 오토인코더 학습 ---
+        # teacher latent (gradient 차단)
+        
+        stu_feat = stu_feat.permute(0, 2, 1)  # [B, T, student_dim] → [B, student_dim, T]
+        tch_feat = tch_feat.permute(0, 2, 1)  # [B, T, teacher_dim] → [B, teacher_dim, T]
+        z_t = self.encoder(tch_feat).detach()            # [B, latent_dim, T]
+        rec = self.decoder(z_t)                          # [B, teacher_dim, T]
+        ae_loss = self.recon_loss(rec, tch_feat)         # Eq.(6)
+        
+        # --- (2) Student feature를 latent로 프로젝션 ---
+        z_s = self.proj(stu_feat)                        # [B, latent_dim, T]
+        
+        # --- (3) 반복적 디노이징 (간단한 Euler 업데이트 형태) ---
+        x = z_s
+        for _ in range(self.steps):
+            pred_noise = self.denoiser(x)                # 노이즈 예측
+            x = x - pred_noise / self.steps              # 한 스텝 디노이징
+        denoised = x                                     # ˆZ(stu)
+        
+        # --- (4) 최종 KD 손실 계산 ---
+        diffkd_loss = self.distill_loss(denoised, z_t)   # Eq.(7)
+        
+        return ae_loss + diffkd_loss
+
 class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def __init__(self, cfg, trainer, teacher_model, use_logit_distillation=True, kd_alpha=0.1, kd_temperature=1.0, use_layerwise_distillation=False, layer_kd_alpha=1.0):
         super().__init__(cfg=cfg, trainer=trainer)
@@ -335,6 +405,8 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         layer_kd_alpha=1.0,
         use_flow_matching=False,
         flow_cfg=None,
+        use_diffkd=False,
+        diffkd_cfg=None,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
         self.teacher = teacher_model
@@ -346,6 +418,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.layer_kd_alpha = layer_kd_alpha
         self.use_flow_matching = use_flow_matching
         self.layer_sampling_steps = None
+        self.use_diffkd = use_diffkd
         # Lazy init for layer projection
         
         self.flow_matching = None
@@ -355,11 +428,16 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             assert self.sampling_steps_per_layer is None or len(self.sampling_steps_per_layer) == len(self.encoder.layers), \
                 "sampling_steps_per_layer 길이는 encoder.layers 수와 같아야 합니다."
             self.flow_matching = FlowMatchingModule(flow_cfg)
-        
+        if use_diffkd:
+            assert diffkd_cfg is not None, "diffkd_cfg가 None입니다. DiffKD를 사용하려면 diffkd_cfg를 제공해야 합니다."
+            self.sampling_steps_per_layer = diffkd_cfg.get("sampling_steps_per_layer", None)
+            assert self.sampling_steps_per_layer is None or len(self.sampling_steps_per_layer) == len(self.encoder.layers), \
+                "sampling_steps_per_layer 길이는 encoder.layers 수와 같아야 합니다."
+            self.diffkd = DiffKDModule(diffkd_cfg)
         self.layer_proj = None
         self.stu_feats = []
         self.tch_feats = []
-        if self.use_layerwise_distillation or self.use_flow_matching:
+        if self.use_layerwise_distillation or self.use_flow_matching or self.use_diffkd:
             self.layer_proj = nn.Linear(flow_cfg["student_dim"], flow_cfg["teacher_dim"])
             assert len(self.teacher.encoder.layers) == len(self.encoder.layers), \
                 "student 모델과 teacher 모델의 layer 수가 같아야 합니다."
@@ -397,7 +475,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             3) The greedy token predictions of the model of shape [B, T] (via argmax)
         """
         # ————— layerwise KD용 버퍼 초기화 —————
-        if self.use_layerwise_distillation or self.use_flow_matching:
+        if self.use_layerwise_distillation or self.use_flow_matching or self.use_diffkd:
             self.stu_feats.clear()
             self.tch_feats.clear()
         
@@ -420,7 +498,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         # prepare teacher feature for training
         tch_feat = None
         # if self.use_flow_matching and self.training:
-        if self.use_flow_matching:
+        if self.use_flow_matching or self.use_diffkd:
             with torch.no_grad():
                 proc_t, len_t = self.teacher.preprocessor(input_signal=input_signal, length=input_signal_length)
                 tch_feat, _ = self.teacher.encoder(audio_signal=proc_t, length=len_t)
@@ -524,12 +602,23 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             layer_kd_loss /= len(self.stu_feats)  # 평균화
             self.tch_feats.clear()
 
+        # 8) DiffKD (if enabled)
+        diffkd_loss = torch.tensor(0.0, device=log_probs.device)
+        diffkd_sampling_steps = 5
+        if self.use_diffkd:
+            # 모든 layer feature 사용
+            for i, (stu_feat, tch_feat) in enumerate(zip(self.stu_feats, self.tch_feats)):
+                diffkd_loss += self.diffkd(stu_feat, tch_feat)
+                self.log(f"train_diffkd_loss_{i}", diffkd_loss, prog_bar=False, on_step=True, on_epoch=True)
+            self.log("train_diffkd_loss", diffkd_loss, prog_bar=False, on_step=True, on_epoch=True)
+        
         # 8) Total loss & logging
         total_loss = (
             ctc_loss
             + (self.kd_alpha * logit_kd_loss if self.use_logit_distillation else 0.0)
             + (self.layer_kd_alpha * layer_kd_loss if self.use_layerwise_distillation else 0.0)
             + total_flow_loss
+            + diffkd_loss
         )
         self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
         if self.use_logit_distillation:
@@ -1095,6 +1184,19 @@ def main():
         default=None,
         help="학습 재개할 체크포인트(.ckpt) 파일 경로"
     )    
+    parser.add_argument(
+        "--use_diffkd",
+        type=str2bool,
+        default=False,
+        help="DiffKD knowledge distillation 기법 사용 여부"
+    )
+    parser.add_argument(
+        "--diffkd_steps",
+        type=int,
+        default=5,
+        help="DiffKD denoising 단계 수"
+    )
+
     args = parser.parse_args()
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1250,7 +1352,7 @@ def main():
         model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
     
     else:
-        if args.use_flow_matching:
+        if args.use_flow_matching or args.use_diffkd:
             flow_cfg = {
                     "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin", "unet", "conformer"]
                     "feature_dim": model_cfg.encoder.d_model,
@@ -1269,6 +1371,14 @@ def main():
                     "sampling_steps_per_layer": args.sampling_steps_per_layer,
                     # 필요하다면 cnn일 경우 in_ch, out_ch 등 추가
                 }
+            diffkd_cfg = {
+                "steps": args.diffkd_steps,
+                "student_dim": model_cfg.encoder.d_model,
+                "teacher_dim": teacher_model.cfg.encoder.d_model,
+                "latent_dim": model_cfg.encoder.d_model, # student 모델의 latent dim과 같게
+                
+                # 필요에 따라 추가 하이퍼파라미터
+            }
             model = DistilFlowMatchingCTCModelBPE(
                 cfg=model_cfg,
                 trainer=trainer,
@@ -1281,6 +1391,8 @@ def main():
                 layer_kd_alpha=args.layer_kd_alpha,
                 use_flow_matching=args.use_flow_matching,
                 flow_cfg=flow_cfg,
+                use_diffkd=args.use_diffkd,
+                diffkd_cfg=diffkd_cfg,
             )
         elif args.use_logit_distillation or args.use_layerwise_distillation:
             print(f'distillation 모델을 불러옵니다.')
