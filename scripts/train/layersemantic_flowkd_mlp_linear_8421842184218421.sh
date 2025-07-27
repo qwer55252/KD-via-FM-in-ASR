@@ -7,7 +7,7 @@ OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
 mkdir -p "$OUTPUT_DIR"
 
 # 2) 학습 실행 및 로그 저장
-CUDA_VISIBLE_DEVICES=0 python asr_train.py \
+CUDA_VISIBLE_DEVICES=2 python asr_train.py \
 --output_dir "$OUTPUT_DIR" \
 --data_config_name train_100 \
 --data_train_split train.clean.100 \
@@ -22,6 +22,6 @@ CUDA_VISIBLE_DEVICES=0 python asr_train.py \
 --kd_temperature 1 \
 --kd_alpha 0.1 \
 --layer_kd_alpha 1.0 \
---sampling_steps_per_layer "[1,1,1,1,2,2,2,2,4,4,4,4,8,8,8,8]" \
+--sampling_steps_per_layer "[8,4,2,1,8,4,2,1,8,4,2,1,8,4,2,1]" \
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1

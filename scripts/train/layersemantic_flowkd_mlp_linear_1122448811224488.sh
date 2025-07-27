@@ -22,6 +22,6 @@ CUDA_VISIBLE_DEVICES=0 python asr_train.py \
 --kd_temperature 1 \
 --kd_alpha 0.1 \
 --layer_kd_alpha 1.0 \
---sampling_steps_per_layer "[1,1,1,1,2,2,2,2,4,4,4,4,8,8,8,8]" \
+--sampling_steps_per_layer "[1,1,2,2,4,4,8,8,1,1,2,2,4,4,8,8]" \
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1
