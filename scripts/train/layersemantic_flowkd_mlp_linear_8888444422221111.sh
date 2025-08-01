@@ -1,6 +1,6 @@
 export HF_DATASETS_CACHE="/root/.cache/huggingface/datasets"
 export PRJ_NAME="FlowMatching_KD"
-export EXP_NAME="layersemantic_flowkd_mlp_linear_8421842184218421"
+export EXP_NAME="layersemantic_flowkd_mlp_linear_8888444422221111"
 
 # 1) 출력 디렉토리 생성
 OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
@@ -23,6 +23,6 @@ CUDA_VISIBLE_DEVICES=2 python asr_train.py \
 --kd_temperature 1 \
 --kd_alpha 0.1 \
 --layer_kd_alpha 1.0 \
---sampling_steps_per_layer "[8,4,2,1,8,4,2,1,8,4,2,1,8,4,2,1]" \
+--sampling_steps_per_layer "[8,8,8,8,4,4,4,4,2,2,2,2,1,1,1,1]" \
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1
