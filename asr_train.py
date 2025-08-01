@@ -25,6 +25,7 @@ from nemo.utils.app_state import AppState
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 import glob
 import torch
+import random
 import torch.nn.functional as F
 
 def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
@@ -1172,11 +1173,19 @@ def main():
         choices=["identity", "linear", "conv1d"],
         help="Flow Matching 시 student feature → teacher feature 변환 방식"
     )
+    def parse_sampling_steps_per_layer(s):
+        if s == "random":
+            # 1,2,4,8 중에서 16개를 랜덤하게 선택
+            choices = [1, 2, 4, 8]
+            return [random.choice(choices) for _ in range(16)]
+        else:
+            return json.loads(s)
+
     parser.add_argument(
         "--sampling_steps_per_layer",
-        type=lambda s: json.loads(s),   # 또는: lambda s: ast.literal_eval(s)
+        type=parse_sampling_steps_per_layer,
         default=None,
-        help="각 레이어별로 Flow Matching 시 사용하는 샘플링 단계 수 (e.g. \"[1,1,2,2]\")"
+        help="각 레이어별로 Flow Matching 시 사용하는 샘플링 단계 수 (e.g. \"[1,1,2,2]\" 또는 \"random\")"
     )
     parser.add_argument(
         "--resume_ckpt",
@@ -1221,7 +1230,7 @@ def main():
         max_retries=10,
         disable_tqdm=False,
         download_desc="Downloading LibriSpeech ASR",
-        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=7200)}},
         delete_extracted=False,
         extract_compressed_file=True,
         force_extract=True,            
@@ -1456,7 +1465,7 @@ def main():
         results = trainer.test(
             model=model,
             dataloaders=[dl],
-            ckpt_path=last_ckpt_path or None,
+            ckpt_path=args.resume_ckpt if args.resume_ckpt else last_ckpt_path,
             verbose=True,
         )
         
