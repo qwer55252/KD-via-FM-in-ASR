@@ -9,8 +9,9 @@ mkdir -p "$OUTPUT_DIR"
 # 2) 학습 실행 및 로그 저장
 CUDA_VISIBLE_DEVICES=1 python asr_train.py \
 --output_dir "$OUTPUT_DIR" \
---data_config_name train_100 \
---data_train_split train.clean.100 \
+--data_dir "/workspace/KD-via-FM-in-ASR/data/all" \
+--data_config_name all \
+--data_train_split "train.clean.100+train.clean.360+train.other.500" \
 --data_val_split dev.clean \
 --data_test_split test.clean \
 --batch_size 32 \

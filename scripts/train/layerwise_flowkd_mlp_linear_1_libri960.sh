@@ -1,13 +1,13 @@
 export HF_DATASETS_CACHE="/root/.cache/huggingface/datasets"
 export PRJ_NAME="FlowMatching_KD"
-export EXP_NAME="layerwise_flowkd_mlp_linear_sampling8_libri960"
+export EXP_NAME="layerwise_flowkd_mlp_linear_sampling1_libri960"
 
 # 1) 출력 디렉토리 생성
 OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
 mkdir -p "$OUTPUT_DIR"
 
 # 2) 학습 실행 및 로그 저장
-CUDA_VISIBLE_DEVICES=0 python asr_train.py \
+CUDA_VISIBLE_DEVICES=3 python asr_train.py \
 --output_dir "$OUTPUT_DIR" \
 --data_dir "/workspace/KD-via-FM-in-ASR/data/all" \
 --data_config_name all \
@@ -23,6 +23,6 @@ CUDA_VISIBLE_DEVICES=0 python asr_train.py \
 --kd_temperature 1 \
 --kd_alpha 0.1 \
 --layer_kd_alpha 1.0 \
---flow_steps 8
+--flow_steps 1
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1
