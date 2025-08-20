@@ -430,20 +430,18 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 "sampling_steps_per_layer 길이는 encoder.layers 수와 같아야 합니다."
             self.flow_matching = FlowMatchingModule(flow_cfg)
             # ----- Dynamic router 설정 -----
-            
             self.use_dynamic_steps = flow_cfg.get("use_dynamic_steps", True)
-            # FlowMatchingModule 내부에서 쓰는 training_sampling(최대 step)
-            self.max_sampling_steps = flow_cfg.get("training_sampling", 8)
-            self.router_weight = flow_cfg.get("router_weight", 0.1)
+            self.router_strategy = flow_cfg.get("router_strategy", "batch_mode")
+            self.router_weight = flow_cfg.get("router_weight", 1.0)
             self.router = DepthRouter(
-                feature_dim=flow_cfg["student_dim"],
-                max_steps=self.max_sampling_steps,
-                min_steps=1,
-                hidden=flow_cfg.get("router_hidden", 128),
-                use_layer_id=True,
-                num_layers=len(self.encoder.layers),
-                temperature=flow_cfg.get("router_temperature", 1.0),
-                target_avg_steps=flow_cfg.get("router_target_avg_steps", self.max_sampling_steps), 
+                student_dim = flow_cfg["student_dim"],
+                teacher_dim =  flow_cfg["teacher_dim"],
+                max_steps = flow_cfg.get("router_max_sampling_steps", 16),
+                min_steps = 1,
+                hidden_dim = flow_cfg.get("router_hidden", 128),
+                use_layer_id = True,
+                num_layers = len(self.encoder.layers),
+                temperature = flow_cfg.get("router_temperature", 1.0),
             )
         if use_diffkd:
             assert diffkd_cfg is not None, "diffkd_cfg가 None입니다. DiffKD를 사용하려면 diffkd_cfg를 제공해야 합니다."
@@ -520,47 +518,73 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 proc_t, len_t = self.teacher.preprocessor(input_signal=input_signal, length=input_signal_length)
                 tch_feat, _ = self.teacher.encoder(audio_signal=proc_t, length=len_t)
         # flow matching (training & inference)
-        total_flow_loss = torch.tensor(0.0, device=encoder_out.device)
-        total_router_loss = torch.tensor(0.0, device=encoder_out.device)
-        avg_expected_steps = []
+        total_loss = torch.tensor(0.0, device=encoder_out.device)
         if self.use_flow_matching:
+            total_flow_loss = torch.tensor(0.0, device=encoder_out.device)
+            total_router_loss = torch.tensor(0.0, device=encoder_out.device)
+            batch_mean_sampling_steps = []
             for i, (stu_feat, tch_feat) in enumerate(zip(self.stu_feats, self.tch_feats)):
                 # ------ Layer별 sampling step 결정 ------
-                layer_sampling_steps = None
-                # 1) 고정 리스트가 주어졌으면 우선 사용
-                if self.sampling_steps_per_layer is not None:
-                    layer_sampling_steps = int(self.sampling_steps_per_layer[i])
-                # 2) 그 외에는 라우터로 동적 결정 (훈련/추론 공통)
-                elif self.use_dynamic_steps:
-                    # 초기 안정화를 위해 detach 권장 (원하면 end-to-end로 바꿔도 됨)
-                    steps_i, r_loss, r_aux = self.router(stu_feat.detach(), layer_id=i)
-                    # 안정성: [1, max_sampling_steps]로 클램프
-                    steps_i = max(1, min(int(steps_i), self.max_sampling_steps))
-                    layer_sampling_steps = steps_i
-                    total_router_loss = total_router_loss + r_loss
-                    if "expected_steps" in r_aux:
-                        avg_expected_steps.append(r_aux["expected_steps"])
-                    # 라우팅 통계 로깅(원하면 확장)
-                    self.log(f"router/expected_steps_l{i}", r_aux["expected_steps"], on_step=True, on_epoch=True, prog_bar=False)
-
-                flow_loss, fm_encoder_out, fm_info = self.flow_matching(stu_feat, tch_feat, layer_sampling_steps=layer_sampling_steps, layer_id=i)
-                total_flow_loss += flow_loss
-                # (선택) 라우터 통계 로깅
-                if fm_info is not None and isinstance(fm_info, dict):
-                    ra = fm_info.get("router_aux", {})
-                    if isinstance(ra, dict) and "expected_steps" in ra:
-                        self.log(f"router/expected_steps_l{i}", ra["expected_steps"], on_step=True, on_epoch=True, prog_bar=False)     
+                # 1) 라우터로 동적 결정 (훈련/추론 공통)
+                if self.use_dynamic_steps:
+                    steps_batch, router_loss = self.router(stu_feat, tch_feat, layer_id=i) # (B,)
+                    batch_mean_sampling_steps.append(steps_batch.float().mean())
+                    total_router_loss += router_loss
+                    # 1-1) 배치 단위로 최빈값 sampling step을 선택
+                    if self.router_strategy == "batch_mode":
+                        layer_sampling_step = int(torch.mode(steps_batch).values.item())
+                        flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
+                        total_flow_loss += flow_loss
+                    # 1-2) 배치 단위로 평균 sampling step을 선택
+                    elif self.router_strategy == "batch_avg":
+                        avg_val = torch.round(steps_batch.float().mean()).clamp(1, self.flow_cfg["router_max_sampling_steps"])
+                        layer_sampling_step = int(avg_val.item())
+                        flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
+                        total_flow_loss += flow_loss
+                    # 1-3) 배치 단위로 중앙값 sampling step을 선택
+                    elif self.router_strategy == "batch_median":
+                        med_val = torch.median(steps_batch.float())
+                        layer_sampling_step = int(med_val.clamp(1, self.flow_cfg["router_max_sampling_steps"]).item())
+                        flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
+                        total_flow_loss += flow_loss
+                    # 1-4) 배치 내에서 sampling step이 같은 group을 묶어서 처리
+                    elif self.router_strategy == "group":                        
+                        unique_steps = torch.unique(steps_batch)
+                        fm_encoder_out = torch.zeros_like(stu_feat.permute(0, 2, 1))  # (B, T, C) 임시 버퍼인데, TODO: 이거 맞아? fm_encoder_out 이 원래 stu_feat이랑 shape이 같나?
+                        for s in unique_steps.tolist():
+                            idx = (steps_batch == s)
+                            if idx.any():
+                                flow_loss_s, fm_encoder_out_s = self.flow_matching(stu_feat[idx], tch_feat[idx], layer_sampling_step = int(s), layer_id = i)
+                                fm_encoder_out[idx] = fm_encoder_out_s
+                                total_flow_loss += flow_loss_s
+                    else:
+                        raise ValueError(f"Unknown router strategy: {self.router_strategy}")
+                else:
+                    # 2) 고정 리스트가 주어졌으면 우선 사용
+                    if self.sampling_steps_per_layer is not None:
+                        layer_sampling_step = int(self.sampling_steps_per_layer[i])
+                    else:
+                        # 3) 고정값 사용 (훈련/추론 공통)
+                        layer_sampling_step = self.flow_cfg.get("training_sampling", 8)
+                    flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
+                    total_flow_loss += flow_loss
+                
+                
                 # print(f'i: {i}, flow_loss: {flow_loss}')
-            # print(f"Total flow matching loss: {total_flow_loss.item()}")
-            # loss logging
+            total_loss += total_router_loss * self.router_weight
+            total_loss += total_flow_loss
             
+            # print(f"Total flow matching loss: {total_flow_loss.item()}")
+            # 로그
             self.log("train_flow_matching_loss", total_flow_loss, prog_bar=False, on_step=True, on_epoch=True)
             if self.use_dynamic_steps:
                 self.log("train_router_loss", self.router_weight * total_router_loss, prog_bar=False, on_step=True, on_epoch=True)
-                if len(avg_expected_steps) > 0:
-                    mean_exp = torch.stack(list(avg_expected_steps)).mean()
-                    self.log("router/expected_steps_mean", mean_exp, on_step=True, on_epoch=True, prog_bar=False)
+                if len(batch_mean_sampling_steps) > 0:
+                    mean_exp = torch.stack([v if v.ndim == 0 else v.mean() for v in batch_mean_sampling_steps]).mean()
+                    self.log("router/batch_mean_sampling_steps_mean", mean_exp, on_step=True, on_epoch=True, prog_bar=False)
 
+            
+            
             # flow matching 결과 fm_encoder_out: (B, T, C) 
             # → decoder가 기대하는 (B, C, T) 순으로 non-inplace 변환
             encoder_out = fm_encoder_out.transpose(1, 2) # TODO: 이거 있는게 나은지 없는게 나은지 실험해보자 -> kobie-175에서    (일단은 있이 ㄱㄱ)
@@ -570,7 +594,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         log_probs = self.decoder(encoder_output=encoder_out)
         greedy_preds = log_probs.argmax(dim=-1, keepdim=False)
         if self.training:
-            return log_probs, encoded_len, greedy_preds, total_flow_loss, encoder_out
+            return log_probs, encoded_len, greedy_preds, total_loss, encoder_out
         else:
             return log_probs, encoded_len, greedy_preds
     
@@ -920,87 +944,118 @@ class ConformerEncoder(nn.Module):
 
 class DepthRouter(nn.Module):
     """
-    Per-layer global router: (B,T,D) feature를 평균(pool)해
-    각 레이어에서 사용할 sampling step을 {1,...,S_max} 중 하나로 선택.
-    - discrete 선택: gumbel-softmax + straight-through
-    - budget regularization: 사용 평균 step을 목표에 맞춤
+    Flow-Matching KD를 위한 동적 라우터.
+    학생(Student)과 교사(Teacher) 피처를 전역 평균 풀링하고, 선택적으로
+    layer id 임베딩을 더해 작은 MLP로 샘플링 스텝 수를 예측한다.
+    학습 시 Gumbel-Softmax를 사용하여 미분 가능한 방법으로 스텝 수를 샘플링하고,
+    추론 시에는 확률 분포의 argmax를 사용한다.
     """
-    def __init__(self, feature_dim, max_steps: int, min_steps: int = 1,
-                 hidden: int = 128, use_layer_id: bool = True, num_layers: int = None,
-                 temperature: float = 1.0, target_avg_steps: float = None):
+    def __init__(
+        self,
+        student_dim: int,
+        teacher_dim: int,
+        max_steps: int = 16,
+        min_steps: int = 1,
+        hidden_dim: int = 128,
+        use_layer_id: bool = True,
+        num_layers: int | None = None,
+        temperature: float = 1.0,
+        target_avg_steps: float | None = None,
+        embed_dim: int = 16,
+    ) -> None:
         super().__init__()
-        assert 1 <= min_steps <= max_steps
-        self.min_steps = min_steps
-        self.max_steps = max_steps
-        self.K = max_steps - min_steps + 1  # 선택지 개수
-        self.temperature = temperature
-        self.use_layer_id = use_layer_id
-        self.target_avg_steps = target_avg_steps  # 예: 8
-
-        lid_dim = 32 if use_layer_id else 0
+        assert max_steps >= min_steps >= 1
         if use_layer_id:
-            assert num_layers is not None
-            self.layer_id_emb = nn.Embedding(num_layers, lid_dim)
+            assert num_layers is not None and num_layers > 0
 
-        in_dim = feature_dim + lid_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+        self.student_dim = student_dim
+        self.teacher_dim = teacher_dim
+        self.max_steps = max_steps
+        self.min_steps = min_steps
+        self.temperature = temperature
+        self.target_avg_steps = target_avg_steps
+
+        # layer id 임베딩 (선택 사항)
+        if use_layer_id:
+            self.layer_embedding = nn.Embedding(num_layers, embed_dim)
+            input_dim = student_dim + teacher_dim + embed_dim
+        else:
+            self.layer_embedding = None
+            input_dim = student_dim + teacher_dim
+
+        # 작은 MLP: Linear -> ReLU -> Linear
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden, self.K)  # 각 step 후보에 대한 로짓
+            nn.Linear(hidden_dim, max_steps),
         )
 
-        # 정수 step 값 테이블: [1,2,...,S_max] or [min_steps..max_steps]
-        self.register_buffer("step_values", torch.arange(min_steps, max_steps + 1).float())
+        # 1, 2, …, max_steps 값을 buffer로 보관 (디바이스 자동 이동)
+        self.register_buffer(
+            "step_values",
+            torch.arange(min_steps, max_steps + 1, dtype=torch.float32),
+            persistent=False,
+        )
 
-    def forward(self, feat_btd, layer_id: int):
+    def forward(
+        self,
+        stu_feat: torch.Tensor,
+        tch_feat: torch.Tensor,
+        layer_id: int | torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        feat_btd: (B,T,D) - 해당 레이어 입력 또는 현재 상태 특성 (student/teacher 중 택1 또는 concat)
-        layer_id: int
-        return:
-          steps_int (int scalar tensor), router_info(dict with losses, probs)
+        파라미터:
+            stu_feat: (B, H_s, T) 형태의 학생 피처
+            tch_feat: (B, H_t, T) 형태의 교사 피처
+            layer_id: 레이어 번호 (use_layer_id=True일 때 필요)
+        반환:
+            steps: (B,) 형태의 정수 텐서, 선택된 샘플링 스텝 수
+            router_loss: 스텝 수에 대한 손실 (평균값 또는 목표값과의 오차)
         """
-        B, T, D = feat_btd.shape
-        x = feat_btd.mean(dim=(0,1))  # (D,) per-layer global 표본
-        if self.use_layer_id:
-            lid = self.layer_id_emb.weight[layer_id]  # (lid_dim,)
-            x = torch.cat([x, lid], dim=-1)
+        B = stu_feat.size(0)
+        # 전역 평균 풀링으로 (B, H) 벡터 생성:contentReference[oaicite:2]{index=2}
+        stu_pool = stu_feat.mean(dim=-1)
+        tch_pool = tch_feat.mean(dim=-1)
 
-        logits = self.mlp(x)  # (K,)
-        # gumbel-softmax (straight-through)
-        gumbel = F.gumbel_softmax(logits, tau=self.temperature, hard=True)  # one-hot (K,)
+        # layer id 임베딩 추가 (필요시)
+        if self.layer_embedding is not None:
+            assert layer_id is not None
+            if isinstance(layer_id, int):
+                lid = torch.tensor([layer_id], device=stu_feat.device).repeat(B)
+            else:
+                lid = layer_id.to(stu_feat.device)
+            id_embed = self.layer_embedding(lid)
+            inp = torch.cat([stu_pool, tch_pool, id_embed], dim=1)
+        else:
+            inp = torch.cat([stu_pool, tch_pool], dim=1)
 
-        # expected steps(soft) 도 함께 계산 (모니터링/regularization에 유용)
-        probs = logits.softmax(dim=-1)  # (K,)
-        expected_steps = (probs * self.step_values).sum()
+        # MLP로 logits 계산
+        logits = self.net(inp)  # (B, max_steps)
 
-        # hard onehot과 매핑된 정수 steps
-        steps = int((gumbel * self.step_values).sum().item())
-        steps_tensor = (gumbel * self.step_values).sum()  # scalar tensor (ST로 gradient 전달)
-
-        router_loss = 0.0
-        aux = {}
-
-        # budget loss (선택): 평균 step을 target에 맞추기
-        if self.training and self.target_avg_steps is not None:
-            budget_loss = (expected_steps - self.target_avg_steps) ** 2
-            router_loss = router_loss + budget_loss
-            aux["budget_loss"] = budget_loss.detach()
-
-        # entropy reg (분포 쏠림 완화)
         if self.training:
-            ent = -(probs * (probs.clamp_min(1e-8)).log()).sum()
-            # 큰 entropy 유도 → 다양한 step 사용, 과도하면 가중치 낮추세요
-            entropy_reg = -0.01 * ent
-            router_loss = router_loss + entropy_reg
-            aux["entropy_reg"] = entropy_reg.detach()
-            aux["entropy"] = ent.detach()
+            # 학습 시 Gumbel-Softmax로 확률 분포 샘플링:contentReference[oaicite:3]{index=3}
+            step_probs = F.gumbel_softmax(
+                logits, tau=self.temperature, hard=False, dim=-1
+            )
+            # 기대 스텝 수 계산
+            expected_steps = (step_probs * self.step_values).sum(dim=-1)
+            chosen_idx = step_probs.argmax(dim=-1)
+            steps = self.step_values[chosen_idx]
+        else:
+            # 추론 시 softmax의 argmax 사용
+            step_probs = F.softmax(logits, dim=-1)
+            expected_steps = (step_probs * self.step_values).sum(dim=-1)
+            chosen_idx = step_probs.argmax(dim=-1)
+            steps = self.step_values[chosen_idx]
 
-        aux["expected_steps"] = expected_steps.detach()
-        aux["probs"] = probs.detach()
-        aux["logits"] = logits.detach()
-        aux["steps_tensor"] = steps_tensor  # for logs
+        # router_loss: 평균 기대 스텝 또는 목표 평균 스텝과의 제곱 오차
+        if self.target_avg_steps is None:
+            router_loss = expected_steps.mean()
+        else:
+            diff = expected_steps.mean() - float(self.target_avg_steps)
+            router_loss = diff * diff
 
-        return steps, router_loss, aux
+        return steps.to(torch.long), router_loss
 
 class FlowMatchingModule(nn.Module):
     def __init__(self, flow_cfg, router: nn.Module = None, router_weight: float = 0.1):
@@ -1100,27 +1155,11 @@ class FlowMatchingModule(nn.Module):
         else:
             raise NotImplementedError
 
-    def forward(self, s_f, t_f=None, target=None, layer_sampling_steps: int = None, layer_id: int = None):
-        # 1) 라우터가 있으면 layer_sampling_steps를 동적으로 산출
-        router_loss = 0.0
-        router_aux = {}
-        if (layer_sampling_steps is None) and (self.router is not None):
-            # s_f: (B,T,Hs) 를 그대로 넣어 per-layer global step 산출
-            steps, r_loss, aux = self.router(s_f.detach(),  # 라우터 안정화를 위해 detach 권장(초기)
-                                             layer_id=layer_id if layer_id is not None else 0)
-            layer_sampling_steps = int(max(1, min(int(steps), self.training_sampling)))
-            router_loss = r_loss
-            router_aux = aux
-
-        # 2) 기존 로직 유지하되, layer_sampling_steps만 동적으로 주입
-        sampling_steps = self.training_sampling if self.training else self.inference_sampling
-        stride = self.training_sampling // layer_sampling_steps if layer_sampling_steps else 1
-        stride *= -1
-
+    def forward(self, s_f, t_f=None, target=None, layer_sampling_step: int = None, layer_id: int = None):    
         x = s_f
-        for i in range(sampling_steps, 0, stride):
+        for i in range(layer_sampling_step, 0, -1):
             # s_f.shape: (32, 179, 88)
-            t = torch.full((s_f.size(0), s_f.size(1), 1), i / sampling_steps, device=s_f.device)
+            t = torch.full((s_f.size(0), s_f.size(1), 1), i / layer_sampling_step, device=s_f.device)
             # t.shape: (32, 179, 1)
             embed_t = self.time_embed(t)
             # embed_t.shape: (32, 179, 32)
@@ -1158,16 +1197,13 @@ class FlowMatchingModule(nn.Module):
                         pad_amt = T_x - T_v
                         velocity = F.pad(velocity, (0, pad_amt))
             # x: (batch, seq_len, Hs), velocity: (batch, seq_len, Hs)
-            if layer_sampling_steps:
-                x = x - velocity / layer_sampling_steps
-            else:
-                x = x - velocity / sampling_steps
-
+            x = x - velocity / layer_sampling_step
+            
         # 기존 loss
         loss = 0.0
         if self.training and t_f is not None:
             # t = t.permute(0, 2, 1)
-            dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t)
+            dalpha_dt, dsigma_dt = self.noise_schedule_deriv(t) # TODO: t를 이렇게?
             noise_scheduled_x = (dalpha_dt * s_f - velocity) / (-dsigma_dt)
             if self.shape_transform_type == "linear":
                 transformed_s_f = self.shape_transformation_function(noise_scheduled_x)
@@ -1177,9 +1213,8 @@ class FlowMatchingModule(nn.Module):
             loss = kd_loss
 
         # 라우터 loss를 합산(가중치 조절)
-        total_loss = loss + self.router_weight * router_loss
 
-        return total_loss, x, {"router_aux": router_aux, "kd_loss": loss}
+        return loss, x
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1362,6 +1397,25 @@ def main():
         default=False,
         help="DiffKD knowledge distillation 기법 사용 여부"
     )
+    parser.add_argument(
+        "--router_temperature",
+        type=float,
+        default=1.0,
+        help="DepthRouter의 온도 파라미터 (1.0이 기본값)"
+    )
+    parser.add_argument(
+        "--router_max_sampling_steps",
+        type=int,
+        default=8,
+        help="DepthRouter가 선택할 수 있는 최대 샘플링 단계 수"
+    )
+    parser.add_argument(
+        "--router_strategy",
+        type=str,
+        default="batch_mode",
+        choices=["batch_mode", "batch_avg", "batch_median", "group"],
+        help="라우팅 전략 기본값: 'batch_mode' | 'batch_avg' | 'batch_median' | 'group'"
+        )
     args = parser.parse_args()
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1537,12 +1591,12 @@ def main():
                     # 필요하다면 cnn일 경우 in_ch, out_ch 등 추가
                     # --- Router ---
                     "use_dynamic_steps": args.use_dynamic_steps,
-                    "router_weight": 0.1,               # total loss에 라우터 loss 기여
+                    "router_strategy": args.router_strategy, # 라우팅 전략 기본값: 'batch_mode' | 'batch_avg' | 'batch_middle' | 'group'
+                    "router_weight": args.router_weight,               # total loss에 라우터 loss 기여
                     "router_hidden": 128,
-                    "router_temperature": 1.0,          # 1.5 → 1.0 → 0.7 스케줄링 권장
-                    "router_target_avg_steps": 8,       # 고정 baseline과 공정 비교: 평균을 맞춤
-                    "router_entropy_coef": 0.01,
-                    "router_budget_coef": 1.0,
+                    "router_temperature": args.router_temperature,          # 1.5 → 1.0 → 0.7 스케줄링 권장
+                    # "router_target_avg_steps": 8,       # 고정 baseline과 공정 비교: 평균을 맞춤
+                    "router_max_sampling_steps": args.router_max_sampling_steps if hasattr(args, 'router_max_sampling_steps') else 16,
                 }
             diffkd_cfg = {
                 "steps": args.diffkd_steps,
