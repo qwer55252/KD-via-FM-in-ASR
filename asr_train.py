@@ -433,15 +433,13 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             self.use_dynamic_steps = flow_cfg.get("use_dynamic_steps", True)
             self.router_strategy = flow_cfg.get("router_strategy", "batch_mode")
             self.router_weight = flow_cfg.get("router_weight", 1.0)
-            self.router = DepthRouter(
-                student_dim = flow_cfg["student_dim"],
-                teacher_dim =  flow_cfg["teacher_dim"],
-                max_steps = flow_cfg.get("router_max_sampling_steps", 16),
-                min_steps = 1,
-                hidden_dim = flow_cfg.get("router_hidden", 128),
-                use_layer_id = True,
-                num_layers = len(self.encoder.layers),
-                temperature = flow_cfg.get("router_temperature", 1.0),
+            self.router = DynamicStepRouter(
+                max_steps=flow_cfg.get("router_max_sampling_steps", 16), min_steps=1,
+                stu_dim=flow_cfg["student_dim"], tch_dim=flow_cfg["teacher_dim"],
+                use_layer_id=True, num_layers=len(self.encoder.layers), layer_emb_dim=32,
+                temperature=flow_cfg.get("router_temperature", 1.0),                 # 초기에 크게(예: 2.0~4.0) → 점점 낮추기
+                budget_target=8.0, budget_weight=0.05,
+                entropy_weight=0.001,
             )
         if use_diffkd:
             assert diffkd_cfg is not None, "diffkd_cfg가 None입니다. DiffKD를 사용하려면 diffkd_cfg를 제공해야 합니다."
@@ -527,7 +525,10 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                 # ------ Layer별 sampling step 결정 ------
                 # 1) 라우터로 동적 결정 (훈련/추론 공통)
                 if self.use_dynamic_steps:
-                    steps_batch, router_loss = self.router(stu_feat, tch_feat, layer_id=i) # (B,)
+                    steps_batch, router_loss, aux = self.router(stu_feat, tch_feat, layer_id=i)
+                    # steps: (B,) 예: tensor([3,5,4,7, ...])
+                    # rloss: 스칼라 라우터 정규화 손실
+                    # aux["probs"]: (B,K), aux["expected_steps"]: (B,)
                     batch_mean_sampling_steps.append(steps_batch.float().mean())
                     total_router_loss += router_loss
                     # 1-1) 배치 단위로 최빈값 sampling step을 선택
@@ -942,120 +943,204 @@ class ConformerEncoder(nn.Module):
         # return (B, T, encoder_dim)
         return x
 
-class DepthRouter(nn.Module):
+class DynamicStepRouter(nn.Module):
     """
-    Flow-Matching KD를 위한 동적 라우터.
-    학생(Student)과 교사(Teacher) 피처를 전역 평균 풀링하고, 선택적으로
-    layer id 임베딩을 더해 작은 MLP로 샘플링 스텝 수를 예측한다.
-    학습 시 Gumbel-Softmax를 사용하여 미분 가능한 방법으로 스텝 수를 샘플링하고,
-    추론 시에는 확률 분포의 argmax를 사용한다.
+    Flow-Matching KD에서 sampling step 수(1..max_steps)를 정하는 라우터.
+
+    입력:
+      - stu_feat: (B, Hs, T)  or (B, T, Hs) 도 허용
+      - tch_feat: (B, Ht, T)  or (B, T, Ht) 도 허용
+      - layer_id: (B,) 또는 스칼라 int (옵션, use_layer_id=True일 때)
+
+    출력:
+      - steps: (B,) 선택된 정수 스텝 (학습: 샘플, 평가: argmax)
+      - router_loss: 스칼라 (budget + entropy 등)
+      - aux: dict (probs, logits, expected_steps 등 디버그용)
+
+    옵션 특징:
+      - use_layer_id: 레이어 ID 임베딩을 추가 특징으로 사용
+      - budget_target: 목표 평균 스텝(실수). 없으면 budget 항 비활성화
+      - budget_weight: budget 정규화 가중치
+      - entropy_weight: 엔트로피 정규화(탐색 유도)
+      - temperature: Gumbel-Softmax 온도(학습 중 점진적 감소 권장)
+      - min_steps, max_steps: 허용 구간(기본 1..max_steps)
+      - feature_reduce: 'gap' | 'mean' | 'last' 등 시간축 축약 방식
     """
     def __init__(
         self,
-        student_dim: int,
-        teacher_dim: int,
         max_steps: int = 16,
         min_steps: int = 1,
+        stu_dim: int = None,
+        tch_dim: int = None,
         hidden_dim: int = 128,
-        use_layer_id: bool = True,
-        num_layers: int | None = None,
+        proj_dim: int = 128,
+        use_layer_id: bool = False,
+        num_layers: int = None,       # use_layer_id=True일 때 필요(임베딩 크기 결정)
+        layer_emb_dim: int = 32,
+        feature_reduce: str = "gap",  # 'gap'|'mean'|'last'
         temperature: float = 1.0,
-        target_avg_steps: float | None = None,
-        embed_dim: int = 16,
-    ) -> None:
+        budget_target: float | None = None,
+        budget_weight: float = 0.1,
+        entropy_weight: float = 0.0,
+        allow_channel_last: bool = True,
+    ):
         super().__init__()
-        assert max_steps >= min_steps >= 1
-        if use_layer_id:
-            assert num_layers is not None and num_layers > 0
-
-        self.student_dim = student_dim
-        self.teacher_dim = teacher_dim
+        assert 1 <= min_steps <= max_steps
         self.max_steps = max_steps
         self.min_steps = min_steps
+        self.K = max_steps  # 카테고리 수(1..K)
         self.temperature = temperature
-        self.target_avg_steps = target_avg_steps
+        self.use_layer_id = use_layer_id
+        self.feature_reduce = feature_reduce
+        self.allow_channel_last = allow_channel_last
 
-        # layer id 임베딩 (선택 사항)
+        # 입력 차원 명시 필요
+        assert stu_dim is not None and tch_dim is not None, "stu_dim/tch_dim을 지정하세요."
+
+        # (Hs)->proj_dim, (Ht)->proj_dim 로 투영
+        self.stu_proj = nn.Sequential(
+            nn.Linear(stu_dim, proj_dim),
+            nn.ReLU(inplace=True)
+        )
+        self.tch_proj = nn.Sequential(
+            nn.Linear(tch_dim, proj_dim),
+            nn.ReLU(inplace=True)
+        )
+
         if use_layer_id:
-            self.layer_embedding = nn.Embedding(num_layers, embed_dim)
-            input_dim = student_dim + teacher_dim + embed_dim
+            assert num_layers is not None and num_layers > 0
+            self.layer_emb = nn.Embedding(num_layers, layer_emb_dim)
+            router_in = proj_dim * 2 + layer_emb_dim
         else:
-            self.layer_embedding = None
-            input_dim = student_dim + teacher_dim
+            self.layer_emb = None
+            router_in = proj_dim * 2
 
-        # 작은 MLP: Linear -> ReLU -> Linear
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, max_steps),
+        # 작은 MLP 라우터 → K개의 logits
+        self.router = nn.Sequential(
+            nn.Linear(router_in, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, self.K)
         )
 
-        # 1, 2, …, max_steps 값을 buffer로 보관 (디바이스 자동 이동)
-        self.register_buffer(
-            "step_values",
-            torch.arange(min_steps, max_steps + 1, dtype=torch.float32),
-            persistent=False,
-        )
+        # 정규화 관련 하이퍼
+        self.budget_target = budget_target  # 목표 평균 스텝(예: 6.0)
+        self.budget_weight = budget_weight
+        self.entropy_weight = entropy_weight
 
-    def forward(
-        self,
-        stu_feat: torch.Tensor,
-        tch_feat: torch.Tensor,
-        layer_id: int | torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        파라미터:
-            stu_feat: (B, H_s, T) 형태의 학생 피처
-            tch_feat: (B, H_t, T) 형태의 교사 피처
-            layer_id: 레이어 번호 (use_layer_id=True일 때 필요)
-        반환:
-            steps: (B,) 형태의 정수 텐서, 선택된 샘플링 스텝 수
-            router_loss: 스텝 수에 대한 손실 (평균값 또는 목표값과의 오차)
-        """
-        B = stu_feat.size(0)
-        # 전역 평균 풀링으로 (B, H) 벡터 생성:contentReference[oaicite:2]{index=2}
-        stu_pool = stu_feat.mean(dim=-1)
-        tch_pool = tch_feat.mean(dim=-1)
+        # 선택적: 불가 구간 마스킹(여기선 min_steps>1일 때 전처리용 bias)
+        mask = torch.full((self.K,), 0.0)
+        if self.min_steps > 1:
+            mask[: self.min_steps - 1] = float("-inf")
+        self.register_buffer("logit_mask", mask)
 
-        # layer id 임베딩 추가 (필요시)
-        if self.layer_embedding is not None:
-            assert layer_id is not None
+    @staticmethod
+    def _to_channel_first(x):
+        # 허용 모드: (B, C, T) 또는 (B, T, C). 후자는 변환
+        if x.dim() != 3:
+            raise ValueError("Feature must be 3D (B, C, T) or (B, T, C).")
+        B, A, B_or_T = x.shape
+        # 간단 휴리스틱: 시간축이 더 길 가능성이 높음
+        # 하지만 allow_channel_last=True면 (B,T,C)로 간주 가능
+        return x.transpose(1, 2) if A > B_or_T else x
+
+    def _reduce_time(self, x):  # x: (B, C, T)
+        if self.feature_reduce == "gap":
+            return x.mean(dim=-1)  # (B, C)
+        elif self.feature_reduce == "mean":
+            return x.mean(dim=-1)
+        elif self.feature_reduce == "last":
+            return x[..., -1]      # (B, C)
+        else:
+            raise ValueError(f"unknown feature_reduce: {self.feature_reduce}")
+
+    def forward(self, stu_feat, tch_feat, layer_id=None, temperature: float | None = None, train_mode: bool | None = None):
+        if train_mode is None:
+            train_mode = self.training
+        if temperature is None:
+            temperature = self.temperature
+
+        # 입력 정형화
+        if self.allow_channel_last:
+            # (B,T,C)면 (B,C,T)로 바꾸기
+            if stu_feat.shape[1] != stu_feat.shape[2]:  # 단순 휴리스틱
+                stu_feat = stu_feat.transpose(1, 2)
+            if tch_feat.shape[1] != tch_feat.shape[2]:
+                tch_feat = tch_feat.transpose(1, 2)
+        else:
+            stu_feat = self._to_channel_first(stu_feat)
+            tch_feat = self._to_channel_first(tch_feat)
+
+        # 시간 축 축약 → (B, Hs), (B, Ht)
+        stu_vec = self._reduce_time(stu_feat)  # (B, Hs)
+        tch_vec = self._reduce_time(tch_feat)  # (B, Ht)
+
+        # 공통 차원으로 투영
+        stu_h = self.stu_proj(stu_vec)  # (B, P)
+        tch_h = self.tch_proj(tch_vec)  # (B, P)
+
+        # layer id 임베딩(옵션)
+        if self.use_layer_id:
+            if layer_id is None:
+                raise ValueError("use_layer_id=True 이면 layer_id가 필요합니다.")
             if isinstance(layer_id, int):
-                lid = torch.tensor([layer_id], device=stu_feat.device).repeat(B)
-            else:
-                lid = layer_id.to(stu_feat.device)
-            id_embed = self.layer_embedding(lid)
-            inp = torch.cat([stu_pool, tch_pool, id_embed], dim=1)
+                layer_id = torch.full((stu_h.size(0),), layer_id, dtype=torch.long, device=stu_h.device)
+            lyr = self.layer_emb(layer_id)  # (B, E)
+            h = torch.cat([stu_h, tch_h, lyr], dim=-1)
         else:
-            inp = torch.cat([stu_pool, tch_pool], dim=1)
+            h = torch.cat([stu_h, tch_h], dim=-1)
 
-        # MLP로 logits 계산
-        logits = self.net(inp)  # (B, max_steps)
+        # 라우터 로짓
+        logits = self.router(h)  # (B, K)
 
-        if self.training:
-            # 학습 시 Gumbel-Softmax로 확률 분포 샘플링:contentReference[oaicite:3]{index=3}
-            step_probs = F.gumbel_softmax(
-                logits, tau=self.temperature, hard=False, dim=-1
-            )
-            # 기대 스텝 수 계산
-            expected_steps = (step_probs * self.step_values).sum(dim=-1)
-            chosen_idx = step_probs.argmax(dim=-1)
-            steps = self.step_values[chosen_idx]
+        # min_steps 제한용 마스크 적용
+        if self.min_steps > 1:
+            logits = logits + self.logit_mask  # -inf가 앞쪽에 더해져 선택 불가
+
+        # 확률
+        probs = F.softmax(logits, dim=-1)  # (B, K)
+        expected_steps = (probs * torch.arange(1, self.K + 1, device=probs.device)).sum(dim=-1)  # (B,)
+
+        if train_mode:
+            # Gumbel-Softmax (straight-through)
+            y_soft = F.gumbel_softmax(logits, tau=temperature, hard=False, dim=-1)
+            # hard one-hot: straight-through trick
+            index = y_soft.argmax(dim=-1)
+            y_hard = torch.zeros_like(y_soft).scatter_(1, index.unsqueeze(1), 1.0)
+            y = (y_hard - y_soft).detach() + y_soft  # (B,K) gradient는 y_soft, fwd는 y_hard
+
+            # 샘플된 step (1..K)
+            steps = index + 1
+
+            # 정규화 손실
+            losses = []
+
+            # (1) Budget: 평균 스텝이 budget_target에 가깝도록
+            if self.budget_target is not None and self.budget_weight > 0:
+                batch_mean = steps.float().mean()
+                budget_loss = (batch_mean - self.budget_target) ** 2
+                losses.append(self.budget_weight * budget_loss)
+
+            # (2) Entropy: 분포가 너무 예리/평평하지 않도록
+            if self.entropy_weight > 0:
+                # 평균 엔트로피(큰 값일수록 탐색)
+                entropy = -(probs * (probs.clamp_min(1e-8)).log()).sum(dim=-1).mean()
+                # 일반적으론 엔트로피를 '높이고' 싶으면 -entropy를 최소화 항에 넣음
+                # 즉 loss += -w * entropy
+                losses.append(-self.entropy_weight * entropy)
+
+            router_loss = sum(losses) if len(losses) else logits.new_zeros([])
         else:
-            # 추론 시 softmax의 argmax 사용
-            step_probs = F.softmax(logits, dim=-1)
-            expected_steps = (step_probs * self.step_values).sum(dim=-1)
-            chosen_idx = step_probs.argmax(dim=-1)
-            steps = self.step_values[chosen_idx]
+            # 평가: argmax
+            index = probs.argmax(dim=-1)
+            steps = index + 1
+            router_loss = logits.new_zeros([])
 
-        # router_loss: 평균 기대 스텝 또는 목표 평균 스텝과의 제곱 오차
-        if self.target_avg_steps is None:
-            router_loss = expected_steps.mean()
-        else:
-            diff = expected_steps.mean() - float(self.target_avg_steps)
-            router_loss = diff * diff
-
-        return steps.to(torch.long), router_loss
+        aux = {
+            "logits": logits,
+            "probs": probs,
+            "expected_steps": expected_steps,  # 연속 기대값(분포 기반 계획에 참고)
+        }
+        return steps, router_loss, aux
 
 class FlowMatchingModule(nn.Module):
     def __init__(self, flow_cfg, router: nn.Module = None, router_weight: float = 0.1):
@@ -1396,6 +1481,12 @@ def main():
         type=str2bool,
         default=False,
         help="DiffKD knowledge distillation 기법 사용 여부"
+    )
+    parser.add_argument(
+        "--router_weight",
+        type=float,
+        default=1.0,
+        help="DepthRouter loss 의 가중치 (0.0: 라우터 loss 비활성화, 1.0: 활성화)"
     )
     parser.add_argument(
         "--router_temperature",
