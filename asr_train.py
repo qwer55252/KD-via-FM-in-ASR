@@ -420,6 +420,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.use_flow_matching = use_flow_matching
         self.layer_sampling_steps = None
         self.use_diffkd = use_diffkd
+        self.router_max_sampling_steps = flow_cfg.get("router_max_sampling_steps", 16) if use_flow_matching else None
         # Lazy init for layer projection
         
         self.flow_matching = None
@@ -538,20 +539,20 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
                         total_flow_loss += flow_loss
                     # 1-2) 배치 단위로 평균 sampling step을 선택
                     elif self.router_strategy == "batch_avg":
-                        avg_val = torch.round(steps_batch.float().mean()).clamp(1, self.flow_cfg["router_max_sampling_steps"])
+                        avg_val = torch.round(steps_batch.float().mean()).clamp(1, self.router_max_sampling_steps)
                         layer_sampling_step = int(avg_val.item())
                         flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
                         total_flow_loss += flow_loss
                     # 1-3) 배치 단위로 중앙값 sampling step을 선택
                     elif self.router_strategy == "batch_median":
                         med_val = torch.median(steps_batch.float())
-                        layer_sampling_step = int(med_val.clamp(1, self.flow_cfg["router_max_sampling_steps"]).item())
+                        layer_sampling_step = int(med_val.clamp(1, self.router_max_sampling_steps).item())
                         flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
                         total_flow_loss += flow_loss
                     # 1-4) 배치 내에서 sampling step이 같은 group을 묶어서 처리
                     elif self.router_strategy == "group":                        
                         unique_steps = torch.unique(steps_batch)
-                        fm_encoder_out = torch.zeros_like(stu_feat.permute(0, 2, 1))  # (B, T, C) 임시 버퍼인데, TODO: 이거 맞아? fm_encoder_out 이 원래 stu_feat이랑 shape이 같나?
+                        fm_encoder_out = torch.zeros_like(stu_feat)  # (B, T, C) 임시 버퍼인데, TODO: 이거 맞아? fm_encoder_out 이 원래 stu_feat이랑 shape이 같나?
                         for s in unique_steps.tolist():
                             idx = (steps_batch == s)
                             if idx.any():
