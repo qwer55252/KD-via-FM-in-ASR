@@ -539,7 +539,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         diffusion_steps = diffkd_cfg.get("diffusion_steps", 9)
         self.teacher = teacher_model
         self.version = int(version)
-        assert self.version in {1,2,3,4,5,6}, "version은 1~5만 허용합니다."
+        assert self.version in {1,2,3,4,5,6,7,8}, "version은 1~8만 허용합니다."
 
         self.use_ctc = use_ctc
         self.use_logit_distillation = use_logit_distillation
@@ -656,6 +656,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
         # Teacher AE (학습): z_t, recon
         z_t, t_rec = self.tae(t_bct)                 # (B,L,T), (B,Ct,T)
+        z_t = z_t.detach()
         recon_loss = self.recon_crit(t_rec, t_bct)
 
         # Student proj: z_s
@@ -708,6 +709,22 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             fm_loss_post, _ = self.fm_latent_2(z_deno, z_t)
             out["fm_loss_pre"]  = fm_loss_pre
             out["fm_loss_post"] = fm_loss_post
+        elif self.version == 7:
+            # AE + FM(pre) + NoiseAdapter + Diffusion + FM(post)
+            fm_loss_pre, _ = self.fm_latent(z_s, z_t)
+            z_noisy, _ = self.adapter(z_s)
+            z_deno = self.denoiser(z_noisy)
+            fm_loss_post, _ = self.fm_latent_2(z_deno, z_t)
+            out["fm_loss_pre"]  = fm_loss_pre
+            out["fm_loss_post"] = fm_loss_post
+        elif self.version == 8:
+            # AE + NoiseAdapter + Diffusion + FM(앞)
+            fm_loss_pre, z_s_aligned = self.fm_latent(z_s, z_t)
+            z_noisy, _ = self.adapter(z_s_aligned)
+            z_deno = self.denoiser(z_noisy)
+            kd_loss_post = self.kd_crit(z_deno, z_t)
+            out["fm_loss_pre"]  = fm_loss_pre
+            out["kd_loss_post"] = kd_loss_post
 
         return out
 
@@ -763,11 +780,17 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             kd_post_sum = kd_post_sum + losses["kd_loss_post"]
             fm_post_sum = fm_post_sum + losses["fm_loss_post"]
 
-        recon_loss   = recon_sum   / L # TODO: L로 나눠야 할까?
-        kd_loss_pre  = kd_pre_sum  / L
-        fm_loss_pre  = fm_pre_sum  / L
-        kd_loss_post = kd_post_sum / L
-        fm_loss_post = fm_post_sum / L
+        # recon_loss   = recon_sum   / L # TODO: L로 나눠야 할까?
+        # kd_loss_pre  = kd_pre_sum  / L
+        # fm_loss_pre  = fm_pre_sum  / L
+        # kd_loss_post = kd_post_sum / L
+        # fm_loss_post = fm_post_sum / L
+        recon_loss   = recon_sum    # TODO: L로 나눠야 할까?
+        kd_loss_pre  = kd_pre_sum  
+        fm_loss_pre  = fm_pre_sum  
+        kd_loss_post = kd_post_sum 
+        fm_loss_post = fm_post_sum 
+        
 
         # 6) (선택) 기존 DiffKD 추가 사용 시
         diffkd_loss = torch.tensor(0.0, device=log_probs.device)
@@ -1575,7 +1598,7 @@ def main():
     parser.add_argument(
         "--diffkd_steps",
         type=int,
-        default=5,
+        default=9,
         help="DiffKD denoising 단계 수"
     )
     parser.add_argument(
@@ -1613,8 +1636,8 @@ def main():
         "--model_version",
         type=str,
         default="ver1",
-        choices=["ver1", "ver2", "ver3", "ver4", "ver5", "ver6"],
-        help="모델 버전 선택: 'ver1' | 'ver2' | 'ver3' | 'ver4' | 'ver5' | 'ver6'"
+        choices=["ver1", "ver2", "ver3", "ver4", "ver5", "ver6", "ver7", "ver8"],
+        help="모델 버전 선택: 'ver1' | 'ver2' | 'ver3' | 'ver4' | 'ver5' | 'ver6' | 'ver7' | 'ver8'"
         )
     parser.add_argument(
         "--latent_dim",
@@ -1881,6 +1904,26 @@ def main():
                 model = DistilFlowMatchingCTCModelBPE(
                     model_cfg, trainer, teacher_model=teacher_model,
                     version=6,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+            # ver7
+            elif args.model_version == "ver7":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=7,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+            # ver8
+            elif args.model_version == "ver8":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=8,
                     student_dim=88, teacher_dim=176, latent_dim=96,
                     kd_loss_type="mse", # KD loss에 사용될 metric
                     flow_cfg=flow_cfg,
