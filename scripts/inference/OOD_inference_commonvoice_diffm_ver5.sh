@@ -1,7 +1,8 @@
 export HF_DATASETS_CACHE="/root/.cache/huggingface/datasets"
 
 python asr_inference_CV.py \
-  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/diffm_ver5_libri960/checkpoints/last.ckpt" \
+  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/diffm_ver5_libri100/checkpoints/last.ckpt" \
+  --data_dir "/workspace/KD-via-FM-in-ASR/data/commonvoice" \
   --hf_token "$HF_TOKEN" \
   --meta_encoder_type "mlp" \
   --flow_steps 2 \

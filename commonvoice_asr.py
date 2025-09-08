@@ -153,7 +153,7 @@ class CommonVoice(datasets.GeneratorBasedBuilder):
 
         bundle_url_template = STATS["bundleURLTemplate"]
         bundle_version = bundle_url_template.split("/")[0]
-        dl_manager.download_config.ignore_url_params = True
+        # dl_manager.download_config.ignore_url_params = True
 
         self._log_download(self.config.name, bundle_version, hf_auth_token)
         archive_path = dl_manager.download(self._get_bundle_url(self.config.name, bundle_url_template))
