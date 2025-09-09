@@ -8,7 +8,10 @@ Weights & Biases 로깅 포함
 """
 
 import os
+import re
 import json
+import uuid
+import soundfile as sf
 import shutil
 import argparse
 import torch.nn as nn
@@ -28,65 +31,136 @@ import torch
 import random
 import torch.nn.functional as F
 
-def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
-    """
-    HuggingFace Dataset 객체(ds)를 순회하며
-    NeMo 형식의 JSON manifest를 생성
-    """
-    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+def _clean_tedlium_text(s: str) -> str:
+    s = re.sub(r"\{.*?\}", "", s)   # {COUGH} 등 제거
+    s = s.replace("<sil>", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower()
 
-    # 기본 HF_DATASETS_CACHE (원본 오디오가 풀리던 위치)
-    default_root = config.HF_DATASETS_CACHE
-    extract_marker = os.path.join("extracted")
+# def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
+#     """
+#     HuggingFace Dataset 객체(ds)를 순회하며
+#     NeMo 형식의 JSON manifest를 생성
+#     """
+#     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
 
-    # with open(manifest_path, "w") as fout:
-    #     for sample in ds:
-    #         audio = sample["audio"]
-    #         orig_path = audio["path"] 
-    #         # sample["audio"]["path"] : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/2277-149896-0000.flac'
-    #         # 실제 데이터 경로 : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/LibriSpeech/dev-clean/2277/149896/2277-149896-0000.flac'
+#     # 기본 HF_DATASETS_CACHE (원본 오디오가 풀리던 위치)
+#     default_root = config.HF_DATASETS_CACHE
+#     extract_marker = os.path.join("extracted")
+
+#     # with open(manifest_path, "w") as fout:
+#     #     for sample in ds:
+#     #         audio = sample["audio"]
+#     #         orig_path = audio["path"] 
+#     #         # sample["audio"]["path"] : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/2277-149896-0000.flac'
+#     #         # 실제 데이터 경로 : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/LibriSpeech/dev-clean/2277/149896/2277-149896-0000.flac'
             
 
-    #         duration = len(audio["array"]) / audio["sampling_rate"]
-    #         entry = {
-    #             "audio_filepath": orig_path,  # 실제로 존재하는 절대/상대 경로
-    #             "duration": duration,
-    #             "text": sample["text"].lower().strip(),
-    #         }
-    #         fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
+#     #         duration = len(audio["array"]) / audio["sampling_rate"]
+#     #         entry = {
+#     #             "audio_filepath": orig_path,  # 실제로 존재하는 절대/상대 경로
+#     #             "duration": duration,
+#     #             "text": sample["text"].lower().strip(),
+#     #         }
+#     #         fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+#     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+#     # HF가 flac을 풀어놓는 최상위 디렉토리
+#     extract_root = os.path.join(cache_dir, "extracted")
+
+#     with open(manifest_path, "w") as fout:
+#         for sample in ds:
+#             audio     = sample["audio"]
+#             orig_path = audio["path"]  # HF가 알려준 경로 (존재하지 않을 수도 있음)
+
+#             # 1) 첫 시도: orig_path 에 파일이 실제로 존재하는지
+#             if not os.path.isfile(orig_path):
+#                 filename = os.path.basename(orig_path)
+#                 # 2) fallback: extract_root 이하를 재귀 검색
+#                 pattern = os.path.join(extract_root, "**", filename)
+#                 matches = glob.glob(pattern, recursive=True)
+#                 if not matches:
+#                     raise FileNotFoundError(
+#                         f"Audio 파일을 찾을 수 없습니다: {filename} \n"
+#                         f"원경로: {orig_path}\n"
+#                         f"검색경로: {pattern}"
+#                     )
+#                 # 검색 결과 중 첫 번째를 사용
+#                 orig_path = matches[0]
+
+#             duration = len(audio["array"]) / audio["sampling_rate"]
+#             entry = {
+#                 "audio_filepath": orig_path,
+#                 "duration":        duration,
+#                 "text":            sample["text"].lower().strip(),
+#             }
+#             fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
+def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
+    """
+    HF Dataset -> NeMo manifest
+    우선순위: audio.path -> sample["file"] -> array를 임시 wav로 저장
+    """
     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-    # HF가 flac을 풀어놓는 최상위 디렉토리
-    extract_root = os.path.join(cache_dir, "extracted")
+    tmp_audio_dir = os.path.join(cache_dir, "tmp_audio", "tedlium")
+    os.makedirs(tmp_audio_dir, exist_ok=True)
 
-    with open(manifest_path, "w") as fout:
+    with open(manifest_path, "w", encoding="utf-8") as fout:
         for sample in ds:
-            audio     = sample["audio"]
-            orig_path = audio["path"]  # HF가 알려준 경로 (존재하지 않을 수도 있음)
+            audio = sample["audio"]
+            arr = audio.get("array", None)
+            sr  = audio.get("sampling_rate", 16000)
 
-            # 1) 첫 시도: orig_path 에 파일이 실제로 존재하는지
-            if not os.path.isfile(orig_path):
-                filename = os.path.basename(orig_path)
-                # 2) fallback: extract_root 이하를 재귀 검색
-                pattern = os.path.join(extract_root, "**", filename)
-                matches = glob.glob(pattern, recursive=True)
-                if not matches:
-                    raise FileNotFoundError(
-                        f"Audio 파일을 찾을 수 없습니다: {filename} \n"
-                        f"원경로: {orig_path}\n"
-                        f"검색경로: {pattern}"
-                    )
-                # 검색 결과 중 첫 번째를 사용
-                orig_path = matches[0]
+            # 1) 후보 경로 수집
+            candidates = []
+            p = audio.get("path", None)
+            if isinstance(p, str) and p:
+                candidates.append(p)
+            f = sample.get("file", None)
+            if isinstance(f, str) and f:
+                candidates.append(f)
 
-            duration = len(audio["array"]) / audio["sampling_rate"]
-            entry = {
-                "audio_filepath": orig_path,
-                "duration":        duration,
-                "text":            sample["text"].lower().strip(),
-            }
-            fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # 2) 존재하는 첫 경로 선택
+            orig_path = None
+            for c in candidates:
+                if c and os.path.isfile(c):
+                    orig_path = c
+                    break
 
+            # 3) 경로가 없으면 array를 임시 wav로 저장
+            if orig_path is None:
+                if arr is None:
+                    continue
+                base = None
+                if isinstance(f, str) and f:
+                    base = os.path.splitext(os.path.basename(f))[0]
+                if not base:
+                    base = str(sample.get("id", uuid.uuid4().hex))
+                wav_path = os.path.join(tmp_audio_dir, base + ".wav")
+                if os.path.exists(wav_path):
+                    wav_path = os.path.join(tmp_audio_dir, base + f"_{uuid.uuid4().hex[:8]}.wav")
+                sf.write(wav_path, arr, sr)
+                orig_path = wav_path
+
+            # 4) duration 계산
+            if arr is not None:
+                duration = float(len(arr)) / float(sr)
+            else:
+                try:
+                    info = sf.info(orig_path)
+                    # 일부 컨테이너 환경에서 samplerate가 0으로 나올 수 있으니 방어
+                    duration = float(info.frames) / float(info.samplerate) if info.samplerate else 0.0
+                except Exception:
+                    duration = 0.0  # 최후의 방어 (가능하면 로그 출력 권장)
+
+            # 5) 텍스트 정리
+            text = _clean_tedlium_text(sample.get("text", ""))
+
+            # 6) 라인 기록
+            if duration > 0 and orig_path:  # duration 0.0은 버림
+                fout.write(json.dumps(
+                    {"audio_filepath": orig_path, "duration": duration, "text": text},
+                    ensure_ascii=False
+                ) + "\n")
 
 def release_nemoAPI(teacher_model):
     # 1) .nemo 실제 경로 조회
@@ -1577,6 +1651,15 @@ def main():
         print(f"test_manifest DONE: {test_manifest}")
     print("manifest files built.")
     
+    def _assert_nonempty_manifest(path, name):
+        n = sum(1 for _ in open(path, "r", encoding="utf-8") if _.strip())
+        if n == 0:
+            raise RuntimeError(f"{name} manifest has 0 lines: {path}")
+
+    _assert_nonempty_manifest(train_manifest, "train")
+    _assert_nonempty_manifest(val_manifest, "val")
+    _assert_nonempty_manifest(test_manifest, "test")
+    
     # test_mode 데이터셋 축소
     if args.test_mode:
         print("Running in test mode, reducing dataset size...")
@@ -1744,7 +1827,14 @@ def main():
     # print(f"Saved .nemo to {args.output_dir}/{exp_name}")
     
     # 10) 평가 시작
-    split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
+    if "tedlium" in args.data_script_path:
+        split_names = ["validation", "test"]
+    elif "librispeech" in args.data_script_path:
+        split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
+    elif "commonvoice" in args.data_script_path:
+        split_names = ["validation", "test"]
+    else:
+        split_names = [args.data_val_split, args.data_test_split]
     metrics = {}
     for i, split_name in enumerate(split_names):
         print(f"\n===== Evaluating on split: {split_name} =====")
