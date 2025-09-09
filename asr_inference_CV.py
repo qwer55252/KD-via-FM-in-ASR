@@ -452,7 +452,7 @@ def main():
         delete_extracted=False,
     )
 
-    splits = ["validation", "test", "other", "invalidated"]
+    splits = ["validation", "test"]
     all_metrics = {}
 
     for split in splits:
