@@ -536,7 +536,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         super().__init__(cfg=cfg, trainer=trainer)
 
         # 기본 플래그/하이퍼
-        diffusion_steps = diffkd_cfg.get("diffusion_steps", 9)
+        diffusion_steps = diffkd_cfg.get("diffusion_steps", 9) if diffkd_cfg is not None else 9
         self.teacher = teacher_model
         self.version = int(version)
         assert self.version in {1,2,3,4,5,6,7,8}, "version은 1~8만 허용합니다."
