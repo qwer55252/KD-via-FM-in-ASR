@@ -19,6 +19,7 @@ from copy import deepcopy
 from asr_train import (
     release_nemoAPI,
     make_student_config,
+    make_teacher_config,
     build_manifest_from_hf,
     DistilFlowMatchingCTCModelBPE,
 )
@@ -293,6 +294,10 @@ def parse_args():
         "--eval_data", type=str, default="librispeech",
         help="평가할 데이터셋 (librispeech 또는 tedlium2)"
     )
+    parser.add_argument(
+        "--is_teacher", type=bool, default="False",
+        help="teacher 모델로 평가할지 여부 (True/False)"
+    )
     parser.add_argument("--data_sample_rate", type=int, default=16000, help="샘플링 주파수")
     return parser.parse_args()
 
@@ -318,18 +323,27 @@ def main():
     val_m   = os.path.join(manifest_dir, "validation.json")
     test_m  = os.path.join(manifest_dir, "test.json")
 
-    student_cfg = make_student_config(
-        teacher_model=teacher,
-        args=args,
-        train_manifest=train_m,
-        val_manifest=val_m,
-        test_manifest=test_m,
-    )
+    if args.is_teacher:
+        model_cfg = make_teacher_config(
+            teacher_model=teacher,
+            args=args,
+            train_manifest=train_m,
+            val_manifest=val_m,
+            test_manifest=test_m,
+        )
+    else:
+        model_cfg = make_student_config(
+            teacher_model=teacher,
+            args=args,
+            train_manifest=train_m,
+            val_manifest=val_m,
+            test_manifest=test_m,
+        )
 
     # 4) FlowMatching 설정
     flow_cfg = {
         "meta_encoder_type": args.meta_encoder_type,
-        "feature_dim":      student_cfg.encoder.d_model,
+        "feature_dim":      model_cfg.encoder.d_model,
         "time_embed_dim":   32,
         "hidden_dim":       128,
         "training_sampling": args.flow_steps,
@@ -338,14 +352,14 @@ def main():
         "noise_schedule":   args.flow_schedule,
         "loss":             "mse",
         "shape_transform":  "linear",
-        "student_dim":      student_cfg.encoder.d_model,
+        "student_dim":      model_cfg.encoder.d_model,
         "teacher_dim":      teacher.cfg.encoder.d_model,
-        "student_head_num": student_cfg.encoder.n_heads,
+        "student_head_num": model_cfg.encoder.n_heads,
         "teacher_head_num": teacher.cfg.encoder.n_heads,
     }
     diffkd_cfg = {
         "diffusion_steps": 9,
-        "student_dim": student_cfg.encoder.d_model,
+        "student_dim": model_cfg.encoder.d_model,
         "teacher_dim": teacher.cfg.encoder.d_model,
         "latent_dim": 88, # student 모델의 latent dim과 같게
         
@@ -355,7 +369,7 @@ def main():
 
     # (1) 모델 인스턴스 생성
     model = DistilFlowMatchingCTCModelBPE(
-        cfg=student_cfg,
+        cfg=model_cfg,
         trainer=trainer,
         teacher_model=teacher,
         use_ctc=args.use_ctc,
@@ -438,7 +452,7 @@ def main():
         results = trainer.test(
             model=model,
             dataloaders=[dl],
-            ckpt_path=args.ckpt_path,
+            # ckpt_path=args.ckpt_path,
             verbose=False,
         )
         print(f'results: {results}')
