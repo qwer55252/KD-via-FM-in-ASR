@@ -7,5 +7,6 @@ python asr_inference.py \
   --use_diffkd False \
   --use_flow_matching False \
   --data_dir /workspace/KD-via-FM-in-ASR/data/gigaspeech \
-  --eval_data gigaspeech 
+  --eval_data gigaspeech \
+  --is_teacher True
   

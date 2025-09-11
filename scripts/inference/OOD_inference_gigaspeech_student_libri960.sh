@@ -1,6 +1,6 @@
 
 python asr_inference.py \
-  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/libri960_diffkd_steps9/checkpoints/last.ckpt" \
+  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/libri960_student/checkpoints/last.ckpt" \
   --use_ctc True \
   --use_logit_distillation True \
   --use_layerwise_distillation False \
