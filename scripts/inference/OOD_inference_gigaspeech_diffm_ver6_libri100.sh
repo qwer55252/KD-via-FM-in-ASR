@@ -1,6 +1,6 @@
 
 python asr_inference_diffm.py \
-  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/diffm_ver4_libri960/checkpoints/last.ckpt" \
+  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/diffm_ver6_libri100/checkpoints/last.ckpt" \
   --meta_encoder_type "mlp" \
   --flow_steps 2 \
   --flow_schedule "rectified" \
@@ -9,6 +9,6 @@ python asr_inference_diffm.py \
   --use_logit_distillation True \
   --use_layerwise_distillation False \
   --use_flow_matching False \
-  --model_ver 4 \
+  --model_ver 6 \
   --data_dir /workspace/KD-via-FM-in-ASR/data/gigaspeech \
   --eval_data gigaspeech

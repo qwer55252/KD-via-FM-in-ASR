@@ -1,6 +1,6 @@
 
 python asr_inference_diffm.py \
-  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/diffm_ver4_libri960/checkpoints/last.ckpt" \
+  --ckpt_path "/workspace/KD-via-FM-in-ASR/outputs/FlowMatching_KD/diffm_ver4_libri100/checkpoints/last.ckpt" \
   --meta_encoder_type "mlp" \
   --flow_steps 2 \
   --flow_schedule "rectified" \

@@ -9,6 +9,6 @@ python asr_inference_diffm.py \
   --use_logit_distillation True \
   --use_layerwise_distillation False \
   --use_flow_matching False \
-  --model_ver 5 \
+  --model_ver 6 \
   --data_dir /workspace/KD-via-FM-in-ASR/data/gigaspeech \
   --eval_data gigaspeech
