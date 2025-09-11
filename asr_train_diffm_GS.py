@@ -32,37 +32,6 @@ import torch
 import random
 import torch.nn.functional as F
 
-PUNCT_MAP = {
-    "\u2047": " ",  # DOUBLE QUESTION MARK → 제거(공백)
-    "“": '"', "”": '"', "„": '"',
-    "‘": "'", "’": "'",
-    "–": "-", "—": "-",
-    "…": " ", "‹": " ", "›": " ", "«": " ", "»": " ",
-}
-
-def normalize_text_cv(s: str, keep_punct: bool = False) -> str:
-    # 0) 유니코드 정규화 + 소문자
-    s = unicodedata.normalize("NFKC", s or "").strip().lower()
-
-    # 1) 흔한 특수문자 매핑 및 제거
-    for k, v in {"\u2047": " ","“": '"', "”": '"', "„": '"',"‘": "'", "’": "'","–": "-", "—": "-","…": " ", "‹": " ", "›": " ", "«": " ", "»": " ",}.items():   # DOUBLE QUESTION MARK → 제거(공백)
-        s = s.replace(k, v)
-
-    # 2) 바깥 큰따옴표만 한 쌍이면 제거
-    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
-        s = s[1:-1]
-
-    # 3) CV 특유의 공백+아포스트로피 정리: "men 's" → "men's"
-    s = re.sub(r"\s+'\s*s\b", "'s", s)
-
-    # 4) 평가용: 구두점 제거 권장(문자/숫자/공백/아포스트로피/하이픈만 유지)
-    if not keep_punct:
-        s = re.sub(r"[^\p{L}\p{N}\s'\-]", " ", s)
-
-    # 5) 공백 정리
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
 def build_manifest_from_hf_gigaspeech(ds, manifest_path: str, cache_dir: str):
     """
     HF Dataset -> NeMo manifest(JSONL)
@@ -287,78 +256,8 @@ def str2bool(v):
         return False
     raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
 
-class DiffKDModule(nn.Module):
-    """
-    DiffKD: teacher feature를 선형 오토인코더로 잠재 공간으로 압축,
-    student feature를 같은 잠재 공간으로 프로젝션한 뒤
-    반복적 디노이저로 노이즈 제거 → 최종 디노이즈된 student latent와
-    teacher latent 간 MSE 손실을 계산.
-    """
-    def __init__(self, cfg):
-        super().__init__()
-        # 파라미터
-        self.steps       = cfg.get("steps", 5)
-        self.teacher_dim = cfg["teacher_dim"]
-        self.student_dim = cfg["student_dim"]
-        # 잠재 차원 (원하면 cfg로 따로 지정 가능)
-        self.latent_dim  = cfg.get("latent_dim", min(self.teacher_dim, self.student_dim))
-        
-        # 1) Linear Autoencoder (채널 차원 압축 & 재구성)
-        #   - encoder: (B, teacher_dim, T) → (B, latent_dim, T)
-        #   - decoder: (B, latent_dim, T) → (B, teacher_dim, T)
-        self.encoder = nn.Conv1d(self.teacher_dim, self.latent_dim, kernel_size=1)
-        self.decoder = nn.Conv1d(self.latent_dim, self.teacher_dim, kernel_size=1)
-        
-        # 2) Student → latent 프로젝션
-        #   (B, student_dim, T) → (B, latent_dim, T)
-        self.proj    = nn.Conv1d(self.student_dim, self.latent_dim, kernel_size=1)
-        
-        # 3) 디노이저 네트워크 (간단한 1D CNN 블록)
-        self.denoiser = nn.Sequential(
-            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
-        )
-        
-        # 4) 손실 함수
-        self.recon_loss   = nn.MSELoss()
-        self.distill_loss = nn.MSELoss()
-
-    def forward(self, stu_feat, tch_feat, sampling_steps=None):
-        """
-        Args:
-          stu_feat: Tensor [B, T, student_dim]
-          tch_feat: Tensor [B, T, teacher_dim]
-
-        Returns:
-          diffkd_loss: scalar tensor = AE loss + distill loss
-        """
-        # --- (1) Teacher feature 압축 & 재구성으로 오토인코더 학습 ---
-        # teacher latent (gradient 차단)
-        
-        stu_feat = stu_feat.permute(0, 2, 1)  # [B, T, student_dim] → [B, student_dim, T]
-        tch_feat = tch_feat.permute(0, 2, 1)  # [B, T, teacher_dim] → [B, teacher_dim, T]
-        z_t = self.encoder(tch_feat).detach()            # [B, latent_dim, T]
-        rec = self.decoder(z_t)                          # [B, teacher_dim, T]
-        ae_loss = self.recon_loss(rec, tch_feat)         # Eq.(6)
-        
-        # --- (2) Student feature를 latent로 프로젝션 ---
-        z_s = self.proj(stu_feat)                        # [B, latent_dim, T]
-        
-        # --- (3) 반복적 디노이징 (간단한 Euler 업데이트 형태) ---
-        x = z_s
-        for _ in range(self.steps):
-            pred_noise = self.denoiser(x)                # 노이즈 예측
-            x = x - pred_noise / self.steps              # 한 스텝 디노이징
-        denoised = x                                     # ˆZ(stu)
-        
-        # --- (4) 최종 KD 손실 계산 ---
-        diffkd_loss = self.distill_loss(denoised, z_t)   # Eq.(7)
-        
-        return ae_loss + diffkd_loss
-
 class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
-    def __init__(self, cfg, trainer, teacher_model, use_logit_distillation=False, kd_alpha=0.1, kd_temperature=1.0, use_layerwise_distillation=False, layer_kd_alpha=1.0):
+    def __init__(self, cfg, trainer, teacher_model, use_logit_distillation=True, kd_alpha=0.1, kd_temperature=1.0, use_layerwise_distillation=False, layer_kd_alpha=1.0):
         super().__init__(cfg=cfg, trainer=trainer)
         self.teacher = teacher_model
         self.use_logit_distillation = use_logit_distillation
@@ -512,338 +411,521 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.log("train_ctc_loss", ctc_loss, prog_bar=False, on_step=True, on_epoch=True)
         return loss
 
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        signal, sig_len, transcript, transcript_len, sample_id = batch
-        log_probs, encoded_len, predictions, _ = self.forward(input_signal=signal, input_signal_length=sig_len)
-        transcribed = self.wer.decoding.ctc_decoder_predictions_tensor(
-            decoder_outputs=log_probs, decoder_lengths=encoded_len, return_hypotheses=False
+
+class DiffKDModule(nn.Module):
+    """
+    DiffKD: teacher feature를 선형 오토인코더로 잠재 공간으로 압축,
+    student feature를 같은 잠재 공간으로 프로젝션한 뒤
+    반복적 디노이저로 노이즈 제거 → 최종 디노이즈된 student latent와
+    teacher latent 간 MSE 손실을 계산.
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        # 파라미터
+        self.steps       = cfg.get("diffusion_steps", 9)
+        self.teacher_dim = cfg["teacher_dim"]
+        self.student_dim = cfg["student_dim"]
+        # 잠재 차원 (원하면 cfg로 따로 지정 가능)
+        self.latent_dim  = cfg.get("latent_dim", min(self.teacher_dim, self.student_dim))
+        
+        # 1) Linear Autoencoder (채널 차원 압축 & 재구성)
+        #   - encoder: (B, teacher_dim, T) → (B, latent_dim, T)
+        #   - decoder: (B, latent_dim, T) → (B, teacher_dim, T)
+        self.encoder = nn.Conv1d(self.teacher_dim, self.latent_dim, kernel_size=1)
+        self.decoder = nn.Conv1d(self.latent_dim, self.teacher_dim, kernel_size=1)
+        
+        # 2) Student → latent 프로젝션
+        #   (B, student_dim, T) → (B, latent_dim, T)
+        self.proj    = nn.Conv1d(self.student_dim, self.latent_dim, kernel_size=1)
+        
+        # 3) 디노이저 네트워크 (간단한 1D CNN 블록)
+        self.denoiser = nn.Sequential(
+            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(self.latent_dim, self.latent_dim, kernel_size=3, padding=1),
         )
-        if isinstance(sample_id, torch.Tensor):
-            sample_id = sample_id.cpu().numpy()
-        return list(zip(sample_id, transcribed))
+        
+        # 4) 손실 함수
+        self.recon_loss   = nn.MSELoss()
+        self.distill_loss = nn.MSELoss()
+
+    def forward(self, stu_feat, tch_feat, sampling_steps=None):
+        """
+        Args:
+          stu_feat: Tensor [B, T, student_dim]
+          tch_feat: Tensor [B, T, teacher_dim]
+
+        Returns:
+          diffkd_loss: scalar tensor = AE loss + distill loss
+        """
+        # --- (1) Teacher feature 압축 & 재구성으로 오토인코더 학습 ---
+        # teacher latent (gradient 차단)
+        
+        stu_feat = stu_feat.permute(0, 2, 1)  # [B, T, student_dim] → [B, student_dim, T]
+        tch_feat = tch_feat.permute(0, 2, 1)  # [B, T, teacher_dim] → [B, teacher_dim, T]
+        z_t = self.encoder(tch_feat).detach()            # [B, latent_dim, T]
+        rec = self.decoder(z_t)                          # [B, teacher_dim, T]
+        ae_loss = self.recon_loss(rec, tch_feat)         # Eq.(6)
+        
+        # --- (2) Student feature를 latent로 프로젝션 ---
+        z_s = self.proj(stu_feat)                        # [B, latent_dim, T]
+        
+        # --- (3) 반복적 디노이징 (간단한 Euler 업데이트 형태) ---
+        x = z_s
+        for _ in range(self.steps):
+            pred_noise = self.denoiser(x)                # 노이즈 예측
+            x = x - pred_noise / self.steps              # 한 스텝 디노이징
+        denoised = x                                     # ˆZ(stu)
+        
+        # --- (4) 최종 KD 손실 계산 ---
+        diffkd_loss = self.distill_loss(denoised, z_t)   # Eq.(7)
+        
+        return ae_loss + diffkd_loss
+
+
+
+# ─────────────────────────────
+# 공통 블록: 잠재공간 오토인코더/프로젝터/노이즈/디노이저/FMLatent
+class TeacherAutoEncoder(nn.Module):
+    """Teacher feature (B, C_t, T) → latent (B, L, T) → recon (B, C_t, T)"""
+    def __init__(self, teacher_dim: int, latent_dim: int):
+        super().__init__()
+        self.enc = nn.Conv1d(teacher_dim, latent_dim, kernel_size=1)
+        self.dec = nn.Conv1d(latent_dim, teacher_dim, kernel_size=1)
+
+    @torch.no_grad()
+    def encode_nograd(self, x_ct):  # x_ct: (B, C_t, T)
+        return self.enc(x_ct)
+
+    def forward(self, x_ct):         # 학습 시 recon loss 용
+        z_t = self.enc(x_ct)
+        rec = self.dec(z_t)
+        return z_t, rec
+
+class StudentProjector(nn.Module):
+    """Student feature (B, C_s, T) → latent (B, L, T)"""
+    def __init__(self, student_dim: int, latent_dim: int):
+        super().__init__()
+        self.proj = nn.Conv1d(student_dim, latent_dim, kernel_size=1)
+
+    def forward(self, x_cs):         # (B, C_s, T)
+        return self.proj(x_cs)
+
+class NoiseAdapter(nn.Module):
+    """
+    γ(x)∈[0,1] 예측: (B,L,T)->(B,1,T)  → Z_noisy = γ·Z + (1-γ)·ε
+    """
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.gamma_head = nn.Sequential(
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(latent_dim, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z_latent):
+        gamma = self.gamma_head(z_latent)            # (B,1,T), ∈(0,1)
+        eps   = torch.randn_like(z_latent)           # (B,L,T)
+        z_noisy = gamma * z_latent + (1.0 - gamma) * eps
+        return z_noisy, gamma
+
+class SimpleDenoiser(nn.Module):
+    """Diffusion용 간단 1D-CNN 디노이저 (latent 차원 유지)"""
+    def __init__(self, latent_dim: int, steps: int = 5):
+        super().__init__()
+        self.steps = steps
+        self.net = nn.Sequential(
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1),
+        )
+
+    def forward(self, z_in):         # (B,L,T)
+        x = z_in
+        for _ in range(self.steps):
+            pred_noise = self.net(x)
+            x = x - pred_noise / self.steps
+        return x                      # denoised latent
+
+class FMLatent(nn.Module):
+    """
+    잠재공간 전용 FlowMatching 래퍼
+    - 내부적으로 제공된 FlowMatchingModule을 latent_dim으로 구성하여 사용
+    - 입출력/손실 모두 (B,C,T) 기준으로 래핑 (FM은 (B,T,C)를 기대)
+    """
+    def __init__(self, latent_dim: int, flow_cfg: dict):
+        super().__init__()
+        flow_cfg = dict(flow_cfg or {})
+        flow_cfg.setdefault("student_dim", latent_dim)   # FM 내부 feature_dim = latent_dim
+        flow_cfg.setdefault("teacher_dim", latent_dim)
+        flow_cfg.setdefault("shape_transform", "identity")
+        flow_cfg.setdefault("meta_encoder_type", flow_cfg.get("meta_encoder_type", "mlp"))
+        flow_cfg.setdefault("training_sampling", flow_cfg.get("training_sampling", 8))
+        self.fm = FlowMatchingModule(flow_cfg)
+
+        # 기본 스텝 수 (동일 스텝 사용; 라우터 미사용)
+        self.default_steps = int(flow_cfg.get("training_sampling", 8))
+
+    @staticmethod
+    def _to_BT_C(x_bct):  # (B,C,T) -> (B,T,C)
+        return x_bct.transpose(1, 2)
+
+    def forward(self, s_latent_bct, t_latent_bct, steps: int | None = None):
+        """
+        s_latent_bct/t_latent_bct: (B,L,T)
+        returns: fm_loss (scalar), s_out_bct: (B,L,T)
+        """
+        s_btC = self._to_BT_C(s_latent_bct)
+        t_btC = self._to_BT_C(t_latent_bct)
+        layer_steps = int(steps or self.default_steps)
+        fm_loss, s_out_btC = self.fm(s_btC, t_f=t_btC, layer_sampling_step=layer_steps, layer_id=None)
+        s_out_bct = s_out_btC.transpose(1, 2)
+        if not isinstance(fm_loss, torch.Tensor):
+            fm_loss = torch.as_tensor(fm_loss, device=s_latent_bct.device, dtype=s_latent_bct.dtype)
+        return fm_loss, s_out_bct
+# ─────────────────────────────
 
 class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
+    """
+    통합 버전:
+      version=1: AE + KD
+      version=2: AE + FM
+      version=3: AE + NoiseAdapter + Diffusion + KD
+      version=4: AE + NoiseAdapter + Diffusion + FM
+      version=5: AE + FM + NoiseAdapter + Diffusion + FM  (FM 2개)
+    공통으로:
+      - Teacher AE: recon loss 항상 계산
+      - Student 1x1 proj: latent 매핑
+      - 모든 레이어 피처 평균으로 손실 집계
+    """
     def __init__(
         self,
         cfg,
         trainer,
         teacher_model,
+        # 기존 옵션
         use_ctc=True,
         use_logit_distillation=True,
         kd_alpha=0.1,
         kd_temperature=1.0,
         use_layerwise_distillation=False,
         layer_kd_alpha=1.0,
-        use_flow_matching=False,
-        flow_cfg=None,
-        use_diffkd=False,
-        diffkd_cfg=None,
+        # 통합 버전 컨트롤
+        version: int = 1,                           # ★ 1~5
+        kd_loss_type: str = "mse",                  # ver1/3에서 KD 기준
+        # 차원 및 하이퍼
+        student_dim: int = 88,
+        teacher_dim: int = 176,
+        latent_dim: int = 96,
+        # (선택) 기존 FM/DiffKD 경로를 유지하고 싶다면 그대로 두되, 기본은 꺼둠
+        use_flow_matching=False, flow_cfg=None,     # ← 기존 FM (encoder 레벨) 유지 여부
+        use_diffkd=False, diffkd_cfg=None,          # ← 기존 DiffKD 유지 여부
     ):
         super().__init__(cfg=cfg, trainer=trainer)
+
+        # 기본 플래그/하이퍼
+        diffusion_steps = diffkd_cfg.get("diffusion_steps", 9) if diffkd_cfg is not None else 9
         self.teacher = teacher_model
+        self.version = int(version)
+        assert self.version in {1,2,3,4,5,6,7,8}, "version은 1~8만 허용합니다."
+
         self.use_ctc = use_ctc
         self.use_logit_distillation = use_logit_distillation
         self.kd_alpha = kd_alpha
         self.temperature = kd_temperature
         self.use_layerwise_distillation = use_layerwise_distillation
         self.layer_kd_alpha = layer_kd_alpha
+        self.student_dim = student_dim
+        self.teacher_dim = teacher_dim
+        self.latent_dim  = latent_dim
+
+        # 손실
+        self.recon_crit = nn.MSELoss()
+        self.kd_crit = nn.L1Loss() if kd_loss_type == "l1" else nn.MSELoss()
+
+        # 공통 블록
+        self.tae   = TeacherAutoEncoder(teacher_dim=self.teacher_dim, latent_dim=self.latent_dim)
+        self.sproj = StudentProjector(student_dim=self.student_dim, latent_dim=self.latent_dim)
+        self.adapter = NoiseAdapter(latent_dim=self.latent_dim)
+        self.denoiser = SimpleDenoiser(latent_dim=self.latent_dim, steps=diffusion_steps)
+        self.fm_latent = FMLatent(latent_dim=self.latent_dim, flow_cfg=flow_cfg or {})
+        self.fm_latent_2 = FMLatent(latent_dim=self.latent_dim, flow_cfg=flow_cfg or {})
+        
+
+        # (선택) 기존 FM/DiffKD 경로도 그대로 둘 수 있게 보존
         self.use_flow_matching = use_flow_matching
-        self.layer_sampling_steps = None
         self.use_diffkd = use_diffkd
-        self.router_max_sampling_steps = flow_cfg.get("router_max_sampling_steps", 16) if use_flow_matching else None
-        self.flow_cfg = flow_cfg
-        # Lazy init for layer projection
-        
         self.flow_matching = None
-        if use_flow_matching:
+        if self.use_flow_matching:
             assert flow_cfg is not None
+            self.flow_cfg = flow_cfg
             self.sampling_steps_per_layer = flow_cfg.get("sampling_steps_per_layer", None)
-            assert self.sampling_steps_per_layer is None or len(self.sampling_steps_per_layer) == len(self.encoder.layers), \
-                "sampling_steps_per_layer 길이는 encoder.layers 수와 같아야 합니다."
+            assert self.sampling_steps_per_layer is None or len(self.sampling_steps_per_layer) == len(self.encoder.layers)
             self.flow_matching = FlowMatchingModule(flow_cfg)
-            # ----- Dynamic router 설정 -----
-            self.use_dynamic_steps = flow_cfg.get("use_dynamic_steps", True)
-            self.router_strategy = flow_cfg.get("router_strategy", "batch_mode")
-            self.router_weight = flow_cfg.get("router_weight", 1.0)
-            self.router = DynamicStepRouter(
-                max_steps=flow_cfg.get("router_max_sampling_steps", 16), min_steps=1,
-                stu_dim=flow_cfg["student_dim"], tch_dim=flow_cfg["teacher_dim"],
-                use_layer_id=True, num_layers=len(self.encoder.layers), layer_emb_dim=32,
-                temperature=flow_cfg.get("router_temperature", 1.0),                 # 초기에 크게(예: 2.0~4.0) → 점점 낮추기
-                budget_target=8.0, budget_weight=0.05,
-                entropy_weight=0.001,
-            )
-        if use_diffkd:
-            assert diffkd_cfg is not None, "diffkd_cfg가 None입니다. DiffKD를 사용하려면 diffkd_cfg를 제공해야 합니다."
-            self.sampling_steps_per_layer = diffkd_cfg.get("sampling_steps_per_layer", None)
-            assert self.sampling_steps_per_layer is None or len(self.sampling_steps_per_layer) == len(self.encoder.layers), \
-                "sampling_steps_per_layer 길이는 encoder.layers 수와 같아야 합니다."
+            # 라우터 관련은 생략 가능(원본 필요시 그대로 유지)
+
+        if self.use_diffkd:
+            assert diffkd_cfg is not None
             self.diffkd = DiffKDModule(diffkd_cfg)
-        self.layer_proj = None
-        self.stu_feats = []
-        self.tch_feats = []
-        if self.use_layerwise_distillation or self.use_flow_matching or self.use_diffkd:
-            self.layer_proj = nn.Linear(flow_cfg["student_dim"], flow_cfg["teacher_dim"])
-            assert len(self.teacher.encoder.layers) == len(self.encoder.layers), \
-                "student 모델과 teacher 모델의 layer 수가 같아야 합니다."
-            for layer in self.encoder.layers:
-                layer.register_forward_hook(self._capture_stu_feat)
-            for layer in self.teacher.encoder.layers:
-                layer.register_forward_hook(self._capture_tch_feat)
-            
+
+        # hook 준비
+        self.stu_feats, self.tch_feats = [], []
+        # 이 통합 버전은 항상 레이어 피처가 필요(최소 teacher AE, student proj 위해)
+        assert len(self.teacher.encoder.layers) == len(self.encoder.layers), "student/teacher 레이어 수가 같아야 합니다."
+        for layer in self.encoder.layers:
+            layer.register_forward_hook(self._capture_stu_feat)
+        for layer in self.teacher.encoder.layers:
+            layer.register_forward_hook(self._capture_tch_feat)
+
+    def _capture_stu_feat(self, module, inp, out):  # out: (B, Hs, T)
+        self.stu_feats.append(out)
+
+    def _capture_tch_feat(self, module, inp, out):  # out: (B, Ht, T)
+        self.tch_feats.append(out)
+
+    @staticmethod
+    def _BHT_to_BCT(x_bht):  # (B,H,T)->(B,C,T) 동일 의미
+        return x_bht
     
-    def _capture_stu_feat(self, module, input, output): # output: Tensor [B, H, T]
-        self.stu_feats.append(output)
-    def _capture_tch_feat(self, module, input, output):
-        self.tch_feats.append(output)
+    @staticmethod
+    def _BHT_to_BTH(x_bht):  # (B,H,T)->(B,T,H) 동일 의미
+        return x_bht.transpose(1, 2)
 
-    def forward(self, input_signal=None, input_signal_length=None, 
+    def forward(self, input_signal=None, input_signal_length=None,
                 processed_signal=None, processed_signal_length=None):
-        """
-        Forward pass of the model.
 
-        Args:
-            input_signal: Tensor that represents a batch of raw audio signals,
-                of shape [B, T]. T here represents timesteps, with 1 second of audio represented as
-                `self.sample_rate` number of floating point values.
-            input_signal_length: Vector of length B, that contains the individual lengths of the audio
-                sequences.
-            processed_signal: Tensor that represents a batch of processed audio signals,
-                of shape (B, D, T) that has undergone processing via some DALI preprocessor.
-            processed_signal_length: Vector of length B, that contains the individual lengths of the
-                processed audio sequences.
+        # 버퍼 초기화
+        self.stu_feats.clear()
+        self.tch_feats.clear()
 
-        Returns:
-            A tuple of 3 elements -
-            1) The log probabilities tensor of shape [B, T, D].
-            2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
-            3) The greedy token predictions of the model of shape [B, T] (via argmax)
-        """
-        # ————— layerwise KD용 버퍼 초기화 —————
-        if self.use_layerwise_distillation or self.use_flow_matching or self.use_diffkd:
-            self.stu_feats.clear()
-            self.tch_feats.clear()
-        
-        # preprocess
+        # 입력 전처리
         has_input = input_signal is not None and input_signal_length is not None
         has_processed = processed_signal is not None and processed_signal_length is not None
         if (has_input ^ has_processed) is False:
-            raise ValueError("Arguments `input_signal`/`input_signal_length` and `processed_signal`/`processed_signal_length` are mutually exclusive")
+            raise ValueError("`input_signal`/`input_signal_length` 와 `processed_signal`/`processed_signal_length` 는 상호 배타적이어야 합니다.")
         if not has_processed:
             processed_signal, processed_signal_length = self.preprocessor(
-                input_signal=input_signal,
-                length=input_signal_length,
+                input_signal=input_signal, length=input_signal_length
             )
-        # spec augmentation
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
-        # encode
-        encoder_out, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
-        # encoder_out.shape : torch.Size([32, 88, 179])
-        # prepare teacher feature for training
-        tch_feat = None
-        # if self.use_flow_matching and self.training:
-        if self.use_flow_matching or self.use_diffkd:
-            with torch.no_grad():
-                proc_t, len_t = self.teacher.preprocessor(input_signal=input_signal, length=input_signal_length)
-                tch_feat, _ = self.teacher.encoder(audio_signal=proc_t, length=len_t)
-        # flow matching (training & inference)
-        total_loss = torch.tensor(0.0, device=encoder_out.device)
-        if self.use_flow_matching:
-            total_flow_loss = torch.tensor(0.0, device=encoder_out.device)
-            total_router_loss = torch.tensor(0.0, device=encoder_out.device)
-            batch_mean_sampling_steps = []
-            for i, (stu_feat, tch_feat) in enumerate(zip(self.stu_feats, self.tch_feats)):
-                # ------ Layer별 sampling step 결정 ------
-                # 1) 라우터로 동적 결정 (훈련/추론 공통)
-                if self.use_dynamic_steps:
-                    steps_batch, router_loss, aux = self.router(stu_feat, tch_feat, layer_id=i)
-                    # steps: (B,) 예: tensor([3,5,4,7, ...])
-                    # rloss: 스칼라 라우터 정규화 손실
-                    # aux["probs"]: (B,K), aux["expected_steps"]: (B,)
-                    batch_mean_sampling_steps.append(steps_batch.float().mean())
-                    total_router_loss += router_loss
-                    # 1-1) 배치 단위로 최빈값 sampling step을 선택
-                    if self.router_strategy == "batch_mode":
-                        layer_sampling_step = int(torch.mode(steps_batch).values.item())
-                        flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
-                        total_flow_loss += flow_loss
-                    # 1-2) 배치 단위로 평균 sampling step을 선택
-                    elif self.router_strategy == "batch_avg":
-                        avg_val = torch.round(steps_batch.float().mean()).clamp(1, self.router_max_sampling_steps)
-                        layer_sampling_step = int(avg_val.item())
-                        flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
-                        total_flow_loss += flow_loss
-                    # 1-3) 배치 단위로 중앙값 sampling step을 선택
-                    elif self.router_strategy == "batch_median":
-                        med_val = torch.median(steps_batch.float())
-                        layer_sampling_step = int(med_val.clamp(1, self.router_max_sampling_steps).item())
-                        flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
-                        total_flow_loss += flow_loss
-                    # 1-4) 배치 내에서 sampling step이 같은 group을 묶어서 처리
-                    elif self.router_strategy == "group":                        
-                        unique_steps = torch.unique(steps_batch)
-                        fm_encoder_out = torch.zeros_like(stu_feat)  # (B, T, C) 임시 버퍼인데, TODO: 이거 맞아? fm_encoder_out 이 원래 stu_feat이랑 shape이 같나?
-                        for s in unique_steps.tolist():
-                            idx = (steps_batch == s)
-                            if idx.any():
-                                flow_loss_s, fm_encoder_out_s = self.flow_matching(stu_feat[idx], tch_feat[idx], layer_sampling_step = int(s), layer_id = i)
-                                fm_encoder_out[idx] = fm_encoder_out_s
-                                total_flow_loss += flow_loss_s
-                    else:
-                        raise ValueError(f"Unknown router strategy: {self.router_strategy}")
-                else:
-                    # 2) 고정 리스트가 주어졌으면 우선 사용
-                    if self.sampling_steps_per_layer is not None:
-                        layer_sampling_step = int(self.sampling_steps_per_layer[i])
-                    else:
-                        # 3) 고정값 사용 (훈련/추론 공통)
-                        layer_sampling_step = self.flow_cfg.get("training_sampling", 8)
-                    flow_loss, fm_encoder_out= self.flow_matching(stu_feat, tch_feat, layer_sampling_step=layer_sampling_step, layer_id=i)
-                    total_flow_loss += flow_loss
-                
-                
-                # print(f'i: {i}, flow_loss: {flow_loss}')
-            total_loss += total_router_loss * self.router_weight
-            total_loss += total_flow_loss
-            
-            # print(f"Total flow matching loss: {total_flow_loss.item()}")
-            # 로그
-            self.log("train_flow_matching_loss", total_flow_loss, prog_bar=False, on_step=True, on_epoch=True)
-            if self.use_dynamic_steps:
-                self.log("train_router_loss", self.router_weight * total_router_loss, prog_bar=False, on_step=True, on_epoch=True)
-                if len(batch_mean_sampling_steps) > 0:
-                    mean_exp = torch.stack([v if v.ndim == 0 else v.mean() for v in batch_mean_sampling_steps]).mean()
-                    self.log("router/batch_mean_sampling_steps_mean", mean_exp, on_step=True, on_epoch=True, prog_bar=False)
 
-            
-            
-            # flow matching 결과 fm_encoder_out: (B, T, C) 
-            # → decoder가 기대하는 (B, C, T) 순으로 non-inplace 변환
-            encoder_out = fm_encoder_out.transpose(1, 2) # TODO: 이거 있는게 나은지 없는게 나은지 실험해보자 -> kobie-175에서    (일단은 있이 ㄱㄱ)
-        # decode: positional → kwargs 수정
-        
-        # encoder_out.shape : torch.Size([batch, 88, seq_len]) 이어야 함
-        log_probs = self.decoder(encoder_output=encoder_out)
-        greedy_preds = log_probs.argmax(dim=-1, keepdim=False)
+        # 인코딩
+        enc_out_s, enc_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        # Teacher 인코딩(항상 필요: AE용)
+        with torch.no_grad():
+            proc_t, len_t = self.teacher.preprocessor(input_signal=input_signal, length=input_signal_length)
+            _ = self.teacher.encoder(audio_signal=proc_t, length=len_t)
+
+        # decoder 입력은 기본적으로 student encoder 출력
+        log_probs = self.decoder(encoder_output=enc_out_s)
+        greedy = log_probs.argmax(dim=-1)
+
+        # 통합 경로는 training_step에서 손실을 모두 계산하므로,
+        # forward는 디코더 출력만 돌려주면 충분
         if self.training:
-            return log_probs, encoded_len, greedy_preds, total_loss, encoder_out
+            dummy = torch.tensor(0.0, device=enc_out_s.device)
+            return log_probs, enc_len, greedy, dummy, enc_out_s
         else:
-            return log_probs, encoded_len, greedy_preds
-    
-    def training_step(self, batch, batch_idx):
-        # layerwise KD용 teacher buffer 초기화
-        if self.use_layerwise_distillation:
-            self.stu_feats.clear()
-            self.tch_feats.clear()
+            return log_probs, enc_len, greedy
+
+    def _compute_v_losses_one_layer(self, s_bht, t_bht):
+        """
+        단일 레이어 (B,Hs,T), (B,Ht,T)에 대해
+        - teacher AE: z_t, rec_loss
+        - student proj: z_s
+        - version에 따라 KD vs FM, diff 여부 처리
+        반환: dict(losses...), 중간값들
+        """
+        # (B,C,T)
+        s_bct = self._BHT_to_BTH(s_bht)
+        t_bct = self._BHT_to_BTH(t_bht)
+
+        # Teacher AE (학습): z_t, recon
+        z_t, t_rec = self.tae(t_bct)                 # (B,L,T), (B,Ct,T)
+        z_t = z_t.detach()
+        recon_loss = self.recon_crit(t_rec, t_bct)
+
+        # Student proj: z_s
+        z_s = self.sproj(s_bct)                      # (B,L,T)
+
+        out = {
+            "recon_loss": recon_loss,
+            "kd_loss_pre": torch.zeros((), device=s_bct.device),
+            "fm_loss_pre": torch.zeros((), device=s_bct.device),
+            "kd_loss_post": torch.zeros((), device=s_bct.device),
+            "fm_loss_post": torch.zeros((), device=s_bct.device),
+        }
+
+        if self.version == 1:
+            # AE + KD
+            out["kd_loss_pre"] = self.kd_crit(z_s, z_t)
+
+        elif self.version == 2:
+            # AE + FM (latent에서 FM)
+            fm_loss, _ = self.fm_latent(z_s, z_t)
+            out["fm_loss_pre"] = fm_loss
+
+        elif self.version == 3:
+            # AE + NoiseAdapter + Diffusion + KD
+            z_noisy, _ = self.adapter(z_s)
+            z_deno = self.denoiser(z_noisy)
+            out["kd_loss_post"] = self.kd_crit(z_deno, z_t)
+
+        elif self.version == 4:
+            # AE + NoiseAdapter + Diffusion + FM(앞)
+            fm_loss_pre, _ = self.fm_latent(z_s, z_t)
+            z_noisy, _ = self.adapter(z_s)
+            z_deno = self.denoiser(z_noisy)
+            kd_loss_post = self.kd_crit(z_deno, z_t)
+            out["fm_loss_pre"]  = fm_loss_pre
+            out["kd_loss_post"] = kd_loss_post
         
+        elif self.version == 5:
+            # AE + NoiseAdapter + Diffusion + FM(뒤)
+            z_noisy, _ = self.adapter(z_s)
+            z_deno = self.denoiser(z_noisy)
+            fm_loss, _ = self.fm_latent(z_deno, z_t)
+            out["fm_loss_post"] = fm_loss
+
+        elif self.version == 6:
+            # AE + FM(pre) + NoiseAdapter + Diffusion + FM(post)
+            fm_loss_pre, z_s_aligned = self.fm_latent(z_s, z_t)
+            z_noisy, _ = self.adapter(z_s_aligned)
+            z_deno = self.denoiser(z_noisy)
+            fm_loss_post, _ = self.fm_latent_2(z_deno, z_t)
+            out["fm_loss_pre"]  = fm_loss_pre
+            out["fm_loss_post"] = fm_loss_post
+        elif self.version == 7:
+            # AE + FM(pre) + NoiseAdapter + Diffusion + FM(post)
+            fm_loss_pre, _ = self.fm_latent(z_s, z_t)
+            z_noisy, _ = self.adapter(z_s)
+            z_deno = self.denoiser(z_noisy)
+            fm_loss_post, _ = self.fm_latent_2(z_deno, z_t)
+            out["fm_loss_pre"]  = fm_loss_pre
+            out["fm_loss_post"] = fm_loss_post
+        elif self.version == 8:
+            # AE + NoiseAdapter + Diffusion + FM(앞)
+            fm_loss_pre, z_s_aligned = self.fm_latent(z_s, z_t)
+            z_noisy, _ = self.adapter(z_s_aligned)
+            z_deno = self.denoiser(z_noisy)
+            kd_loss_post = self.kd_crit(z_deno, z_t)
+            out["fm_loss_pre"]  = fm_loss_pre
+            out["kd_loss_post"] = kd_loss_post
+
+        return out
+
+    def training_step(self, batch, batch_idx):
         signal, sig_len, transcript, transcript_len = batch
 
-        '''
-        # 1) Student: preprocess + encode 한 번
-        proc_s, len_s = self.preprocessor(input_signal=signal, length=sig_len)ㅋ
-        stu_feat, encoded_len = self.encoder(audio_signal=proc_s, length=len_s)
+        # 1) forward → ASR 출력
+        log_probs, enc_len, greedy_preds, _dummy, enc_out = self.forward(
+            input_signal=signal, input_signal_length=sig_len
+        )
 
-        # 2) Teacher: preprocess+encode 한 번, decoder 한 번 (no grad)
-        with torch.no_grad():
-            proc_t, len_t = self.teacher.preprocessor(
-                input_signal=signal, length=sig_len
-            )
-            tch_feat, _ = self.teacher.encoder(
-                audio_signal=proc_t, length=len_t
-            )
-            tch_logp = self.teacher.decoder(encoder_output=tch_feat)
-
-        # 3) Flow matching (uses stu_feat ⭢ new encoder_out) 
-        if self.use_flow_matching:
-            flow_loss, encoder_out = self.flow_matching(stu_feat, tch_feat)
-        else:
-            flow_loss = torch.tensor(0.0, device=stu_feat.device)
-            encoder_out = stu_feat
-
-        # 4) Decode student once (with matched features)
-        log_probs = self.decoder(encoder_output=encoder_out)
-        greedy_preds = log_probs.argmax(dim=-1)
-        '''
-        log_probs, encoded_len, greedy_preds, total_flow_loss, encoder_out = self.forward(input_signal=signal, input_signal_length=sig_len)
-
-        # 5) CTC loss
+        # 2) CTC loss
         if self.use_ctc:
             ctc_loss = self.loss(
                 log_probs=log_probs,
                 targets=transcript,
-                input_lengths=encoded_len,
+                input_lengths=enc_len,
                 target_lengths=transcript_len,
             )
         else:
             ctc_loss = torch.tensor(0.0, device=log_probs.device)
 
-        # 6) Logit distillation (KL-divergence)
+        # 3) Logit KD
         if self.use_logit_distillation:
             with torch.no_grad():
                 tch_logp = self.teacher.decoder(encoder_output=self.tch_feats[-1].permute(0, 2, 1))
-                tch_p = F.softmax(tch_logp   / self.temperature, dim=-1)
+                tch_p = F.softmax(tch_logp / self.temperature, dim=-1)
             stu_logp = F.log_softmax(log_probs / self.temperature, dim=-1)
-            logit_kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") \
-                       * (self.temperature ** 2)
+            logit_kd_loss = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (self.temperature ** 2)
         else:
             logit_kd_loss = torch.tensor(0.0, device=log_probs.device)
 
-        # 7) Layerwise distillation (student feature vs. teacher feature)
+        # 4) (옵션) Layerwise KD (원본 유지)
         layer_kd_loss = torch.tensor(0.0, device=log_probs.device)
         if self.use_layerwise_distillation:
-            for i, (s, t) in enumerate(zip(self.stu_feats, self.tch_feats)):
-                B, Hs, T = s.size()
+            for s, t in zip(self.stu_feats, self.tch_feats):
+                B, Hs, T = s.shape
                 Ht = t.size(1)
-                # (B, Hs, T) → (B*T, Hs)
                 s_flat = s.transpose(1,2).reshape(-1, Hs)
-                # project → (B*T, Ht) → (B, Ht, T)
-                p_flat = self.layer_proj(s_flat)
+                p_flat = nn.Linear(self.student_dim, self.teacher_dim).to(s.device)(s_flat)  # 임시 투영
                 s_proj = p_flat.reshape(B, T, Ht).transpose(1,2)
-                layer_loss = F.mse_loss(s_proj, t)
-                layer_kd_loss += layer_loss
-            layer_kd_loss /= len(self.stu_feats)  # 평균화
-            self.tch_feats.clear()
+                layer_kd_loss = layer_kd_loss + F.mse_loss(s_proj, t)
+            layer_kd_loss = layer_kd_loss / max(1, len(self.stu_feats))
 
-        # 8) DiffKD (if enabled)
-        diffkd_loss = torch.tensor(0.0, device=log_probs.device)
-        diffkd_sampling_steps = 5
-        if self.use_diffkd:
-            # 모든 layer feature 사용
-            for i, (stu_feat, tch_feat) in enumerate(zip(self.stu_feats, self.tch_feats)):
-                diffkd_loss += self.diffkd(stu_feat, tch_feat)
-                self.log(f"train_diffkd_loss_{i}", diffkd_loss, prog_bar=False, on_step=True, on_epoch=True)
-            self.log("train_diffkd_loss", diffkd_loss, prog_bar=False, on_step=True, on_epoch=True)
+        # 5) 통합(ver1~5) 손실 (레이어 평균)
+        recon_sum = kd_pre_sum = fm_pre_sum = kd_post_sum = fm_post_sum = torch.zeros((), device=log_probs.device)
+        L = max(1, len(self.stu_feats))
+        for s, t in zip(self.stu_feats, self.tch_feats):
+            losses = self._compute_v_losses_one_layer(s, t)
+            recon_sum   = recon_sum   + losses["recon_loss"]
+            kd_pre_sum  = kd_pre_sum  + losses["kd_loss_pre"]
+            fm_pre_sum  = fm_pre_sum  + losses["fm_loss_pre"]
+            kd_post_sum = kd_post_sum + losses["kd_loss_post"]
+            fm_post_sum = fm_post_sum + losses["fm_loss_post"]
+
+        # recon_loss   = recon_sum   / L # TODO: L로 나눠야 할까?
+        # kd_loss_pre  = kd_pre_sum  / L
+        # fm_loss_pre  = fm_pre_sum  / L
+        # kd_loss_post = kd_post_sum / L
+        # fm_loss_post = fm_post_sum / L
+        recon_loss   = recon_sum    # TODO: L로 나눠야 할까?
+        kd_loss_pre  = kd_pre_sum  
+        fm_loss_pre  = fm_pre_sum  
+        kd_loss_post = kd_post_sum 
+        fm_loss_post = fm_post_sum 
         
-        # 8) Total loss & logging
+
+        # 6) (선택) 기존 DiffKD 추가 사용 시
+        diffkd_loss = torch.tensor(0.0, device=log_probs.device)
+        if self.use_diffkd:
+            for s, t in zip(self.stu_feats, self.tch_feats):
+                diffkd_loss = diffkd_loss + self.diffkd(s, t)
+            diffkd_loss = diffkd_loss / L
+
+        # 7) 총 손실
         total_loss = (
             ctc_loss
-            + (self.kd_alpha * logit_kd_loss if self.use_logit_distillation else 0.0)
-            + (self.layer_kd_alpha * layer_kd_loss if self.use_layerwise_distillation else 0.0)
-            + (total_flow_loss * 1.0 if self.use_flow_matching else 0.0)
-            + (diffkd_loss if self.use_diffkd else 0.0)
+            + self.kd_alpha * logit_kd_loss
+            + self.layer_kd_alpha * layer_kd_loss
+            + recon_loss
+            + kd_loss_pre + kd_loss_post
+            + fm_loss_pre + fm_loss_post
+            + diffkd_loss
         )
-        self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
-        if self.use_logit_distillation:
-            self.log("train_logit_kd_loss", logit_kd_loss, on_step=True, on_epoch=True)
-        if self.use_layerwise_distillation:
-            self.log("train_layer_kd_loss", layer_kd_loss, on_step=True, on_epoch=True)
-        if self.use_flow_matching:
-            self.log("train_flow_matching_loss", total_flow_loss, on_step=True, on_epoch=True)
-        self.log("train_loss", total_loss, on_step=True, on_epoch=True)
 
+        # 8) 로깅
+        self.log("loss/ctc", ctc_loss, on_step=True, on_epoch=True)
+        self.log("loss/logit_kd", logit_kd_loss, on_step=True, on_epoch=True)
+        self.log("loss/layer_kd", layer_kd_loss, on_step=True, on_epoch=True)
+
+        self.log("v/recon",   recon_loss,   on_step=True, on_epoch=True)
+        self.log("v/kd_pre",  kd_loss_pre,  on_step=True, on_epoch=True)
+        self.log("v/fm_pre",  fm_loss_pre,  on_step=True, on_epoch=True)
+        self.log("v/kd_post", kd_loss_post, on_step=True, on_epoch=True)
+        self.log("v/fm_post", fm_loss_post, on_step=True, on_epoch=True)
+
+        if self.use_diffkd:
+            self.log("v/diffkd", diffkd_loss, on_step=True, on_epoch=True)
+
+        self.log("train_loss", total_loss, on_step=True, on_epoch=True)
         return total_loss
-    
+
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         signal, sig_len, transcript, transcript_len, sample_id = batch
-        log_probs, encoded_len, predictions, _ = self.forward(input_signal=signal, input_signal_length=sig_len)
+        log_probs, enc_len, predictions, _ = self.forward(input_signal=signal, input_signal_length=sig_len)
         transcribed = self.wer.decoding.ctc_decoder_predictions_tensor(
-            decoder_outputs=log_probs, decoder_lengths=encoded_len, return_hypotheses=False
+            decoder_outputs=log_probs, decoder_lengths=enc_len, return_hypotheses=False
         )
         if isinstance(sample_id, torch.Tensor):
             sample_id = sample_id.cpu().numpy()
         return list(zip(sample_id, transcribed))
-    
+
 def rectified_flow_schedule(t):
     alpha_t = t
     sigma_t = 1 - t
@@ -1280,11 +1362,11 @@ class FlowMatchingModule(nn.Module):
         # 파라미터 파싱
         self.meta_encoder_type = flow_cfg.get("meta_encoder_type", "mlp")
         time_embed_dim = flow_cfg.get("time_embed_dim", 32)
-        hidden_dim = flow_cfg.get("hidden_dim", 128)
+        self.hidden_dim = flow_cfg.get("hidden_dim", 96)
         self.training_sampling = flow_cfg.get("training_sampling", 8)
         self.inference_sampling = flow_cfg.get("inference_sampling", 8)
         self.weight = flow_cfg.get("weight", 1.0)
-        self.feature_dim = flow_cfg.get("student_dim", 88)
+        self.feature_dim = flow_cfg.get("hidden_dim", 96)
         self.teacher_dim = flow_cfg.get("teacher_dim", 176)
         self.student_head_num = flow_cfg.get("student_head_num", 4)
         self.teacher_head_num = flow_cfg.get("teacher_head_num", 8)
@@ -1300,10 +1382,10 @@ class FlowMatchingModule(nn.Module):
         self.meta_encoder = None
         if self.meta_encoder_type == "mlp":
             self.meta_encoder = nn.Sequential(
-                nn.Linear(self.feature_dim + time_embed_dim, hidden_dim),
+                nn.Linear(self.feature_dim + time_embed_dim, self.hidden_dim),
                 # nn.Linear(self.feature_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, self.feature_dim)
+                nn.Linear(self.hidden_dim, self.feature_dim)
             )
         elif self.meta_encoder_type == "cnn":
             # 예시: 1D conv
@@ -1328,7 +1410,7 @@ class FlowMatchingModule(nn.Module):
             # 1D U-Net 기반 flow 네트워크
             self.meta_encoder = UNet1D(
                 in_ch=self.feature_dim + time_embed_dim,
-                base_ch=hidden_dim,
+                base_ch=self.hidden_dim,
                 out_ch=self.feature_dim,
                 num_layers=4
             )
@@ -1342,9 +1424,9 @@ class FlowMatchingModule(nn.Module):
         if shape_transform == "identity":
             self.shape_transformation_function = nn.Identity()
         elif shape_transform == "linear":
-            self.shape_transformation_function = nn.Linear(self.feature_dim, self.teacher_dim)
+            self.shape_transformation_function = nn.Linear(self.feature_dim, self.hidden_dim)
         elif shape_transform == "conv1d":
-            self.shape_transformation_function = nn.Conv1d(self.feature_dim, self.teacher_dim, 1)
+            self.shape_transformation_function = nn.Conv1d(self.feature_dim, self.hidden_dim, 1)
         else:
             raise ValueError(f"Unknown shape_transform type: {shape_transform}")
 
@@ -1639,6 +1721,19 @@ def main():
         choices=["batch_mode", "batch_avg", "batch_median", "group"],
         help="라우팅 전략 기본값: 'batch_mode' | 'batch_avg' | 'batch_median' | 'group'"
         )
+    parser.add_argument(
+        "--model_version",
+        type=str,
+        default="ver1",
+        choices=["ver1", "ver2", "ver3", "ver4", "ver5", "ver6", "ver7", "ver8"],
+        help="모델 버전 선택: 'ver1' | 'ver2' | 'ver3' | 'ver4' | 'ver5' | 'ver6' | 'ver7' | 'ver8'"
+        )
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=96,
+        help="모델 버전 ver5, ver6에서 사용되는 잠재 공간의 차원 (latent dimension)"
+    )
     args = parser.parse_args()
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1693,9 +1788,6 @@ def main():
         download_config=dl_cfg,
         cache_dir=cache_dir,
     )
-    print(f'train_dataset: {train_ds}')
-    print(f'val_dataset: {val_ds}')
-    print(f'test_dataset: {test_ds}')
     print(f'train_ds.cache_files: {train_ds.cache_files}')  # [{'filename': '/home/you/.cache/huggingface/datasets/.../train.arrow', ...}, ...]
     # 2) NeMo manifest 생성
 
@@ -1710,15 +1802,6 @@ def main():
         build_manifest_from_hf_gigaspeech(test_ds, test_manifest, cache_dir)
         print(f"test_manifest DONE: {test_manifest}")
     print("manifest files built.")
-    
-    def _assert_nonempty_manifest(path, name):
-        n = sum(1 for _ in open(path, "r", encoding="utf-8") if _.strip())
-        if n == 0:
-            raise RuntimeError(f"{name} manifest has 0 lines: {path}")
-
-    _assert_nonempty_manifest(train_manifest, "train")
-    _assert_nonempty_manifest(val_manifest, "val")
-    _assert_nonempty_manifest(test_manifest, "test")
     
     # test_mode 데이터셋 축소
     if args.test_mode:
@@ -1803,15 +1886,15 @@ def main():
     # 7) 모델 생성 (가중치는 랜덤 초기화)
     if not is_student:
         print(f'단순 teacher 모델을 불러옵니다.')
-        model = DistilEncDecCTCModelBPE(cfg=model_cfg, trainer=trainer, teacher_model=None)
+        model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
     
     else:
-        if args.use_flow_matching or args.use_diffkd or args.use_logit_distillation or args.use_layerwise_distillation:
+        if args.use_flow_matching or args.use_diffkd or args.model_version:
             flow_cfg = {
                     "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin", "unet", "conformer"]
                     "feature_dim": model_cfg.encoder.d_model,
                     "time_embed_dim": 32,
-                    "hidden_dim": 128,
+                    "hidden_dim": args.latent_dim,
                     "training_sampling": args.flow_steps,
                     "inference_sampling": args.flow_steps,
                     "weight": args.flow_weight,
@@ -1828,54 +1911,131 @@ def main():
                     "use_dynamic_steps": args.use_dynamic_steps,
                     "router_strategy": args.router_strategy, # 라우팅 전략 기본값: 'batch_mode' | 'batch_avg' | 'batch_middle' | 'group'
                     "router_weight": args.router_weight,               # total loss에 라우터 loss 기여
-                    "router_hidden": 128,
+                    "router_hidden": args.latent_dim,
                     "router_temperature": args.router_temperature,          # 1.5 → 1.0 → 0.7 스케줄링 권장
                     # "router_target_avg_steps": 8,       # 고정 baseline과 공정 비교: 평균을 맞춤
                     "router_max_sampling_steps": args.router_max_sampling_steps if hasattr(args, 'router_max_sampling_steps') else 16,
                 }
             diffkd_cfg = {
-                "steps": args.diffkd_steps,
+                "diffusion_steps": args.diffkd_steps,
                 "student_dim": model_cfg.encoder.d_model,
                 "teacher_dim": teacher_model.cfg.encoder.d_model,
-                "latent_dim": model_cfg.encoder.d_model, # student 모델의 latent dim과 같게
+                "latent_dim": args.latent_dim, # student 모델의 latent dim과 같게
                 
                 # 필요에 따라 추가 하이퍼파라미터
             }
-            model = DistilFlowMatchingCTCModelBPE(
+            v1_cfg={
+                "student_dim":  88,          # 너의 student encoder 출력 채널 수
+                "teacher_dim": 176,          # 너의 teacher encoder 출력 채널 수
+                "latent_dim":   96,          # 권장: min(student_dim, teacher_dim) 또는 별도 탐색
+                "kd_loss":      "mse",       # "mse" | "l1"
+                "kd_weight":    1.0,         # v1 KD 손실 가중치
+                "recon_weight": 1.0,         # AE 재구성 손실 가중치
+            }
+            
+            # ver1 (AE + KD)
+            if args.model_version == "ver1":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=1,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,  # ver1은 FM 안쓰지만 placeholder 가능
+                    diffkd_cfg=diffkd_cfg,
+                )
+
+            # ver2 (AE + FM)
+            elif args.model_version == "ver2":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=2,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+
+            # ver3 (AE + Diffusion + KD)
+            elif args.model_version == "ver3":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=3,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+
+            # ver4 (AE + Diffusion + FM(앞쪽))
+            elif args.model_version == "ver4":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=4,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+            
+            # ver5 (AE + Diffusion + FM(뒤쪽))
+            elif args.model_version == "ver5":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=5,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+
+            # ver6 (AE + FM + Diffusion + FM)
+            elif args.model_version == "ver6":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=6,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+            # ver7
+            elif args.model_version == "ver7":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=7,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+            # ver8
+            elif args.model_version == "ver8":
+                model = DistilFlowMatchingCTCModelBPE(
+                    model_cfg, trainer, teacher_model=teacher_model,
+                    version=8,
+                    student_dim=88, teacher_dim=176, latent_dim=96,
+                    kd_loss_type="mse", # KD loss에 사용될 metric
+                    flow_cfg=flow_cfg,
+                    diffkd_cfg=diffkd_cfg
+                )
+            else:
+                raise ValueError(f"Unknown model_version: {args.model_version}")
+            
+        elif args.use_logit_distillation or args.use_layerwise_distillation:
+            print(f'distillation 모델을 불러옵니다.')
+            model = DistilEncDecCTCModelBPE(
                 cfg=model_cfg,
                 trainer=trainer,
                 teacher_model=teacher_model,
-                use_ctc=args.use_ctc,
                 use_logit_distillation=args.use_logit_distillation,
                 kd_alpha=args.kd_alpha,
                 kd_temperature=args.kd_temperature,
                 use_layerwise_distillation=args.use_layerwise_distillation,
                 layer_kd_alpha=args.layer_kd_alpha,
-                use_flow_matching=args.use_flow_matching,
-                flow_cfg=flow_cfg,
-                use_diffkd=args.use_diffkd,
-                diffkd_cfg=diffkd_cfg,
             )
-        # elif args.use_logit_distillation or args.use_layerwise_distillation:
-        #     print(f'distillation 모델을 불러옵니다.')
-        #     model = DistilFlowMatchingCTCModelBPE(
-        #         cfg=model_cfg,
-        #         trainer=trainer,
-        #         teacher_model=teacher_model,
-        #         use_ctc=args.use_ctc,
-        #         use_logit_distillation=args.use_logit_distillation,
-        #         kd_alpha=args.kd_alpha,
-        #         kd_temperature=args.kd_temperature,
-        #         use_layerwise_distillation=args.use_layerwise_distillation,
-        #         layer_kd_alpha=args.layer_kd_alpha,
-        #         use_flow_matching=args.use_flow_matching,
-        #         flow_cfg=flow_cfg,
-        #         use_diffkd=args.use_diffkd,
-        #         diffkd_cfg=diffkd_cfg,
-        #     )
         else:
             print(f'단순 student 모델을 불러옵니다.')
-            model = DistilEncDecCTCModelBPE(cfg=model_cfg, trainer=trainer, teacher_model=None)
+            model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
 
 
     # 8) 학습 시작
@@ -1892,14 +2052,7 @@ def main():
     # print(f"Saved .nemo to {args.output_dir}/{exp_name}")
     
     # 10) 평가 시작
-    if "tedlium" in args.data_script_path:
-        split_names = ["validation", "test"]
-    elif "librispeech" in args.data_script_path:
-        split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
-    elif "commonvoice" in args.data_script_path:
-        split_names = ["validation", "test"]
-    else:
-        split_names = [args.data_val_split, args.data_test_split]
+    split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
     metrics = {}
     for i, split_name in enumerate(split_names):
         print(f"\n===== Evaluating on split: {split_name} =====")

@@ -213,9 +213,9 @@ class Gigaspeech(datasets.GeneratorBasedBuilder):
         splits_to_subsets = self._splits_to_subsets
         if self.config.name in {"dev", "test"}:
             splits = (self.config.name,)
+            splits = ("dev", "test") # dev, test만 사용 (OOD 용으로)
         else:
             splits = ("train", "dev", "test")
-        # splits = ("dev", "test") # dev, test만 사용 (OOD 용으로)
 
         # 1. get number of archives (shards) in each subset
         n_archives_links = {
