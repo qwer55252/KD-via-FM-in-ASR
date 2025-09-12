@@ -366,6 +366,8 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.temperature = kd_temperature
         self.use_layerwise_distillation = use_layerwise_distillation
         self.layer_kd_alpha = layer_kd_alpha
+        self.stu_feats = []
+        self.tch_feats = []
         
         # projection 레이어를 lazy 초기화하기 위한 placeholder
         self.layer_proj = None
@@ -378,6 +380,11 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         H_t = tch_feat.size(1)
         # student→teacher projection
         self.layer_proj = nn.Linear(H_s, H_t).to(stu_feat.device)
+
+    def _capture_stu_feat(self, module, input, output): # output: Tensor [B, H, T]
+        self.stu_feats.append(output)
+    def _capture_tch_feat(self, module, input, output):
+        self.tch_feats.append(output)
 
     def forward(self, input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None):
         """
@@ -400,6 +407,10 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
             3) The greedy token predictions of the model of shape [B, T] (via argmax)
         """
+        # ————— layerwise KD용 버퍼 초기화 —————
+        if self.use_layerwise_distillation or self.use_flow_matching or self.use_diffkd:
+            self.stu_feats.clear()
+            self.tch_feats.clear()
         has_input_signal = input_signal is not None and input_signal_length is not None
         has_processed_signal = processed_signal is not None and processed_signal_length is not None
         if (has_input_signal ^ has_processed_signal) == False:
@@ -430,6 +441,10 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         )
         
     def training_step(self, batch, batch_idx):
+        # layerwise KD용 teacher buffer 초기화
+        if self.use_layerwise_distillation:
+            self.stu_feats.clear()
+            self.tch_feats.clear()
         # 1) base class와 동일하게 입력 unpack
         #    (signal, signal_length, transcript, transcript_length)
         signal, signal_length, transcript, transcript_length = batch
@@ -462,49 +477,27 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             logit_kd_losskd_loss = torch.tensor(0.0, device=log_probs.device)
 
         # layerwise distillation loss
-        layer_loss = torch.tensor(0.0, device=log_probs.device)
+        layer_kd_loss = torch.tensor(0.0, device=log_probs.device)
         if self.use_layerwise_distillation:
-            # 1) raw waveform → feature
-            proc_signal, proc_length = self.preprocessor(
-                input_signal=signal,
-                length=signal_length,
-            )
-            # 2) feature → encoder output (batch, feat_dim, time) 형태
-            stu_feat, _ = self.encoder(
-                audio_signal=proc_signal,
-                length=proc_length,
-            ) # torch.Size([32, 88, 405])
-            with torch.no_grad():
-                # teacher도 동일하게 preprocessor → encoder
-                proc_signal_t, proc_length_t = self.teacher.preprocessor(
-                    input_signal=signal,
-                    length=signal_length,
-                )
-                tch_feat, _ = self.teacher.encoder(
-                    audio_signal=proc_signal_t,
-                    length=proc_length_t,
-                ) # torch.Size([32, 176, 405])
-            
-            # teacher feature 차원 맞추기 (batch, hidden_t, time_t) → (batch, hidden_s, time_s)
-            if self.layer_proj is None:
-                self._init_layer_proj(stu_feat, tch_feat)
-            B, H_s, T_s = stu_feat.size()               # (B, H_s, T_s) torch.Size([32, 88, 405])
-            stu_feat = stu_feat.transpose(1, 2)         # (B, T_s, H_s) torch.Size([32, 405, 88])
-            stu_flat = stu_feat.reshape(-1, H_s)        # (B*T_s, H_s)  torch.Size([12960, 88])
-            proj_flat = self.layer_proj(stu_flat)       # (B*T_s, H_t)  torch.Size([12960, 176])
-            stu_proj = proj_flat.reshape(B, T_s, -1)    # (B, T_s, H_t) torch.Size([32, 405, 176])
-            stu_proj = stu_proj.transpose(1, 2)         # (B, H_t, T_s) torch.Size([32, 176, 405])
-
-            # layer_loss = F.mse_loss(stu_aligned, tch_feat)
-            layer_loss = F.mse_loss(stu_proj, tch_feat)
-            self.log("train_layer_kd_loss", layer_loss, prog_bar=False, on_step=True, on_epoch=True)
+            for i, (s, t) in enumerate(zip(self.stu_feats, self.tch_feats)):
+                B, Hs, T = s.size()
+                Ht = t.size(1)
+                # (B, Hs, T) → (B*T, Hs)
+                s_flat = s.transpose(1,2).reshape(-1, Hs)
+                # project → (B*T, Ht) → (B, Ht, T)
+                p_flat = self.layer_proj(s_flat)
+                s_proj = p_flat.reshape(B, T, Ht).transpose(1,2)
+                layer_loss = F.mse_loss(s_proj, t)
+                layer_kd_loss += layer_loss
+            layer_kd_loss /= len(self.stu_feats)  # 평균화
+            self.tch_feats.clear()
         else:
             layer_loss = torch.tensor(0.0, device=log_probs.device)
 
         # 종합 loss
         loss = ctc_loss \
              + (self.kd_alpha * logit_kd_loss if self.use_logit_distillation else 0.0) \
-             + (self.layer_kd_alpha * layer_loss if self.use_layerwise_distillation else 0.0)
+             + (self.layer_kd_alpha * layer_kd_loss if self.use_layerwise_distillation else 0.0)
 
 
         # logging
@@ -821,7 +814,7 @@ class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             + (self.kd_alpha * logit_kd_loss if self.use_logit_distillation else 0.0)
             + (self.layer_kd_alpha * layer_kd_loss if self.use_layerwise_distillation else 0.0)
             + (total_flow_loss * 1.0 if self.use_flow_matching else 0.0)
-            + (diffkd_loss if self.use_diffkd else 0.0)
+            + diffkd_loss
         )
         self.log("train_ctc_loss", ctc_loss, on_step=True, on_epoch=True)
         if self.use_logit_distillation:
@@ -1806,7 +1799,7 @@ def main():
         model = DistilEncDecCTCModelBPE(cfg=model_cfg, trainer=trainer, teacher_model=None)
     
     else:
-        if args.use_flow_matching or args.use_diffkd or args.use_logit_distillation or args.use_layerwise_distillation:
+        if args.use_flow_matching or args.use_diffkd:
             flow_cfg = {
                     "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin", "unet", "conformer"]
                     "feature_dim": model_cfg.encoder.d_model,
@@ -1856,23 +1849,18 @@ def main():
                 use_diffkd=args.use_diffkd,
                 diffkd_cfg=diffkd_cfg,
             )
-        # elif args.use_logit_distillation or args.use_layerwise_distillation:
-        #     print(f'distillation 모델을 불러옵니다.')
-        #     model = DistilFlowMatchingCTCModelBPE(
-        #         cfg=model_cfg,
-        #         trainer=trainer,
-        #         teacher_model=teacher_model,
-        #         use_ctc=args.use_ctc,
-        #         use_logit_distillation=args.use_logit_distillation,
-        #         kd_alpha=args.kd_alpha,
-        #         kd_temperature=args.kd_temperature,
-        #         use_layerwise_distillation=args.use_layerwise_distillation,
-        #         layer_kd_alpha=args.layer_kd_alpha,
-        #         use_flow_matching=args.use_flow_matching,
-        #         flow_cfg=flow_cfg,
-        #         use_diffkd=args.use_diffkd,
-        #         diffkd_cfg=diffkd_cfg,
-        #     )
+        elif args.use_logit_distillation or args.use_layerwise_distillation:
+            print(f'distillation 모델을 불러옵니다.')
+            model = DistilEncDecCTCModelBPE(
+                cfg=model_cfg,
+                trainer=trainer,
+                teacher_model=teacher_model,
+                use_logit_distillation=args.use_logit_distillation,
+                kd_alpha=args.kd_alpha,
+                kd_temperature=args.kd_temperature,
+                use_layerwise_distillation=args.use_layerwise_distillation,
+                layer_kd_alpha=args.layer_kd_alpha,
+            )
         else:
             print(f'단순 student 모델을 불러옵니다.')
             model = DistilEncDecCTCModelBPE(cfg=model_cfg, trainer=trainer, teacher_model=None)

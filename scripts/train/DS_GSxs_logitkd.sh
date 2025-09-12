@@ -1,6 +1,6 @@
 export HF_DATASETS_CACHE="/root/.cache/huggingface/datasets"
 export PRJ_NAME="FlowMatching_KD"
-export EXP_NAME="DS_GS_logitkd"
+export EXP_NAME="DS_GSxs_logitkd"
 
 # 1) 출력 디렉토리 생성
 OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
@@ -9,7 +9,7 @@ mkdir -p "$OUTPUT_DIR"
 # 2) 학습 실행 및 로그 저장
 CUDA_VISIBLE_DEVICES=2 python asr_train_GS.py \
 --output_dir "$OUTPUT_DIR" \
---data_dir "/workspace/KD-via-FM-in-ASR/data/gigaspeech" \
+--data_dir "/workspace/KD-via-FM-in-ASR/data/gigaspeech_xs" \
 --data_script_path ./gigaspeech.py \
 --data_config_name xs \
 --data_train_split train \
