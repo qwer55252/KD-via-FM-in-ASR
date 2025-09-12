@@ -7,7 +7,7 @@ OUTPUT_DIR="./outputs/$PRJ_NAME/$EXP_NAME"
 mkdir -p "$OUTPUT_DIR"
 
 # 2) 학습 실행 및 로그 저장
-CUDA_VISIBLE_DEVICES=1 python asr_train_GS.py \
+CUDA_VISIBLE_DEVICES=0 python asr_train_GS.py \
 --output_dir "$OUTPUT_DIR" \
 --data_dir "/workspace/KD-via-FM-in-ASR/data/gigaspeech_s" \
 --data_script_path ./gigaspeech.py \
@@ -19,8 +19,6 @@ CUDA_VISIBLE_DEVICES=1 python asr_train_GS.py \
 --epochs 100 \
 --use_ctc True \
 --use_logit_distillation False \
---use_layerwise_distillation False \
---use_flow_matching False \
---train_teacher True \
+--train_teacher_model True \
 
 # > "$OUTPUT_DIR/output_log.txt" 2>&1

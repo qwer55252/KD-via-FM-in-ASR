@@ -474,7 +474,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             logit_kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T*T)
             self.log("train_kd_loss", logit_kd_loss, prog_bar=False, on_step=True, on_epoch=True)
         else:
-            logit_kd_losskd_loss = torch.tensor(0.0, device=log_probs.device)
+            logit_kd_loss = torch.tensor(0.0, device=log_probs.device)
 
         # layerwise distillation loss
         layer_kd_loss = torch.tensor(0.0, device=log_probs.device)
@@ -515,7 +515,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             sample_id = sample_id.cpu().numpy()
         return list(zip(sample_id, transcribed))
 
-class DistilFlowMatchingCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
+class DistilGenerativeCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def __init__(
         self,
         cfg,
@@ -1478,10 +1478,16 @@ def main():
         help="평가 split 이름",
     )
     parser.add_argument(
+        "--train_student_model",
+        type=str2bool,
+        default=False,
+        help="True: student 모델 학습",
+    )
+    parser.add_argument(
         "--train_teacher_model",
         type=str2bool,
         default=False,
-        help="True: teacher 모델 학습, False: student 모델 학습",
+        help="True: teacher 모델 학습",
     )
     parser.add_argument(
         "--use_ctc",
@@ -1787,83 +1793,79 @@ def main():
     if args.train_teacher_model:
         model_cfg = make_teacher_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
         is_student = False
-    else:
+    elif args.train_student_model:
         model_cfg = make_student_config(teacher_model, args, train_manifest, val_manifest, test_manifest)
         is_student = True
     
     print(f'model_cfg: {model_cfg}')
     
     # 7) 모델 생성 (가중치는 랜덤 초기화)
-    if not is_student:
-        print(f'단순 teacher 모델을 불러옵니다.')
-        model = DistilEncDecCTCModelBPE(cfg=model_cfg, trainer=trainer, teacher_model=None)
-    
+    if args.train_teacher_model or args.train_student_model:
+        print(f'단순 EncDecCTCModelBPE 모델을 불러옵니다.')
+        model = nemo_asr.models.EncDecCTCModelBPE(cfg=model_cfg, trainer=trainer)
+    elif args.use_logit_distillation or args.use_layerwise_distillation:
+        print(f'LogitKD, LayerwiseKD 를 위한 DistilEncDecCTCModelBPE 모델을 불러옵니다.')
+        model = DistilEncDecCTCModelBPE(
+            cfg=model_cfg,
+            trainer=trainer,
+            teacher_model=teacher_model,
+            use_logit_distillation=args.use_logit_distillation,
+            kd_alpha=args.kd_alpha,
+            kd_temperature=args.kd_temperature,
+            use_layerwise_distillation=args.use_layerwise_distillation,
+            layer_kd_alpha=args.layer_kd_alpha,
+        )
     else:
-        if args.use_flow_matching or args.use_diffkd:
-            flow_cfg = {
-                    "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin", "unet", "conformer"]
-                    "feature_dim": model_cfg.encoder.d_model,
-                    "time_embed_dim": 32,
-                    "hidden_dim": 128,
-                    "training_sampling": args.flow_steps,
-                    "inference_sampling": args.flow_steps,
-                    "weight": args.flow_weight,
-                    "noise_schedule": args.flow_schedule,  # "rectified", "vp_ode", "ve_ode"
-                    "loss": "mse",  # or "cosine"
-                    "shape_transform": args.shape_transform_type,  # or "linear", "conv1d" 등
-                    "student_dim": model_cfg.encoder.d_model,  # student 모델의 feature dim
-                    "teacher_dim": teacher_model.cfg.encoder.d_model,  # teacher 모델의 feature dim
-                    "student_head_num": model_cfg.encoder.n_heads,  # student 모델의 head 수
-                    "teacher_head_num": teacher_model.cfg.encoder.n_heads,  # teacher 모델의 head
-                    "sampling_steps_per_layer": args.sampling_steps_per_layer,
-                    # 필요하다면 cnn일 경우 in_ch, out_ch 등 추가
-                    # --- Router ---
-                    "use_dynamic_steps": args.use_dynamic_steps,
-                    "router_strategy": args.router_strategy, # 라우팅 전략 기본값: 'batch_mode' | 'batch_avg' | 'batch_middle' | 'group'
-                    "router_weight": args.router_weight,               # total loss에 라우터 loss 기여
-                    "router_hidden": 128,
-                    "router_temperature": args.router_temperature,          # 1.5 → 1.0 → 0.7 스케줄링 권장
-                    # "router_target_avg_steps": 8,       # 고정 baseline과 공정 비교: 평균을 맞춤
-                    "router_max_sampling_steps": args.router_max_sampling_steps if hasattr(args, 'router_max_sampling_steps') else 16,
-                }
-            diffkd_cfg = {
-                "steps": args.diffkd_steps,
-                "student_dim": model_cfg.encoder.d_model,
-                "teacher_dim": teacher_model.cfg.encoder.d_model,
-                "latent_dim": model_cfg.encoder.d_model, # student 모델의 latent dim과 같게
-                
-                # 필요에 따라 추가 하이퍼파라미터
+        print(f'Generative KD 를 위한 DistilGenerativeCTCModelBPE 모델을 불러옵니다.')
+        flow_cfg = {
+                "meta_encoder_type": args.meta_encoder_type,   # ["mlp", "cnn", "swin", "unet", "conformer"]
+                "feature_dim": model_cfg.encoder.d_model,
+                "time_embed_dim": 32,
+                "hidden_dim": 128,
+                "training_sampling": args.flow_steps,
+                "inference_sampling": args.flow_steps,
+                "weight": args.flow_weight,
+                "noise_schedule": args.flow_schedule,  # "rectified", "vp_ode", "ve_ode"
+                "loss": "mse",  # or "cosine"
+                "shape_transform": args.shape_transform_type,  # or "linear", "conv1d" 등
+                "student_dim": model_cfg.encoder.d_model,  # student 모델의 feature dim
+                "teacher_dim": teacher_model.cfg.encoder.d_model,  # teacher 모델의 feature dim
+                "student_head_num": model_cfg.encoder.n_heads,  # student 모델의 head 수
+                "teacher_head_num": teacher_model.cfg.encoder.n_heads,  # teacher 모델의 head
+                "sampling_steps_per_layer": args.sampling_steps_per_layer,
+                # 필요하다면 cnn일 경우 in_ch, out_ch 등 추가
+                # --- Router ---
+                "use_dynamic_steps": args.use_dynamic_steps,
+                "router_strategy": args.router_strategy, # 라우팅 전략 기본값: 'batch_mode' | 'batch_avg' | 'batch_middle' | 'group'
+                "router_weight": args.router_weight,               # total loss에 라우터 loss 기여
+                "router_hidden": 128,
+                "router_temperature": args.router_temperature,          # 1.5 → 1.0 → 0.7 스케줄링 권장
+                # "router_target_avg_steps": 8,       # 고정 baseline과 공정 비교: 평균을 맞춤
+                "router_max_sampling_steps": args.router_max_sampling_steps if hasattr(args, 'router_max_sampling_steps') else 16,
             }
-            model = DistilFlowMatchingCTCModelBPE(
-                cfg=model_cfg,
-                trainer=trainer,
-                teacher_model=teacher_model,
-                use_ctc=args.use_ctc,
-                use_logit_distillation=args.use_logit_distillation,
-                kd_alpha=args.kd_alpha,
-                kd_temperature=args.kd_temperature,
-                use_layerwise_distillation=args.use_layerwise_distillation,
-                layer_kd_alpha=args.layer_kd_alpha,
-                use_flow_matching=args.use_flow_matching,
-                flow_cfg=flow_cfg,
-                use_diffkd=args.use_diffkd,
-                diffkd_cfg=diffkd_cfg,
-            )
-        elif args.use_logit_distillation or args.use_layerwise_distillation:
-            print(f'distillation 모델을 불러옵니다.')
-            model = DistilEncDecCTCModelBPE(
-                cfg=model_cfg,
-                trainer=trainer,
-                teacher_model=teacher_model,
-                use_logit_distillation=args.use_logit_distillation,
-                kd_alpha=args.kd_alpha,
-                kd_temperature=args.kd_temperature,
-                use_layerwise_distillation=args.use_layerwise_distillation,
-                layer_kd_alpha=args.layer_kd_alpha,
-            )
-        else:
-            print(f'단순 student 모델을 불러옵니다.')
-            model = DistilEncDecCTCModelBPE(cfg=model_cfg, trainer=trainer, teacher_model=None)
+        diffkd_cfg = {
+            "steps": args.diffkd_steps,
+            "student_dim": model_cfg.encoder.d_model,
+            "teacher_dim": teacher_model.cfg.encoder.d_model,
+            "latent_dim": model_cfg.encoder.d_model, # student 모델의 latent dim과 같게
+            
+            # 필요에 따라 추가 하이퍼파라미터
+        }
+        model = DistilGenerativeCTCModelBPE(
+            cfg=model_cfg,
+            trainer=trainer,
+            teacher_model=teacher_model,
+            use_ctc=args.use_ctc,
+            use_logit_distillation=args.use_logit_distillation,
+            kd_alpha=args.kd_alpha,
+            kd_temperature=args.kd_temperature,
+            use_layerwise_distillation=args.use_layerwise_distillation,
+            layer_kd_alpha=args.layer_kd_alpha,
+            use_flow_matching=args.use_flow_matching,
+            flow_cfg=flow_cfg,
+            use_diffkd=args.use_diffkd,
+            diffkd_cfg=diffkd_cfg,
+        )
 
 
     # 8) 학습 시작
