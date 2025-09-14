@@ -358,7 +358,7 @@ class DiffKDModule(nn.Module):
         return ae_loss + diffkd_loss
 
 class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
-    def __init__(self, cfg, trainer, teacher_model, use_logit_distillation=False, kd_alpha=0.1, kd_temperature=1.0, use_layerwise_distillation=False, layer_kd_alpha=1.0):
+    def __init__(self, cfg, trainer, teacher_model, use_logit_distillation=False, kd_alpha=0.1, kd_temperature=1.0, use_layerwise_distillation=False, layer_kd_alpha=1.0, train_baseline=False):
         super().__init__(cfg=cfg, trainer=trainer)
         self.teacher = teacher_model
         self.use_logit_distillation = use_logit_distillation
@@ -368,10 +368,18 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         self.layer_kd_alpha = layer_kd_alpha
         self.stu_feats = []
         self.tch_feats = []
+        self.train_baseline = train_baseline
         
         # projection 레이어를 lazy 초기화하기 위한 placeholder
         self.layer_proj = None
         
+    # --- 추가: KD 활성화 여부를 에폭 기준으로 결정 ---
+    def _is_kd_active(self) -> bool:
+        # Lightning 기준: current_epoch는 0부터 시작
+        if self.train_baseline:
+            return int(self.current_epoch) < 10   # 0~9 epoch만 KD ON
+        return bool(self.use_logit_distillation)
+
     def _init_layer_proj(self, stu_feat: torch.Tensor, tch_feat: torch.Tensor):
         """
         stu_feat: (B, H_s, T_s), tch_feat: (B, H_t, T_t)
@@ -408,7 +416,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             3) The greedy token predictions of the model of shape [B, T] (via argmax)
         """
         # ————— layerwise KD용 버퍼 초기화 —————
-        if self.use_layerwise_distillation or self.use_flow_matching or self.use_diffkd:
+        if self.use_layerwise_distillation:
             self.stu_feats.clear()
             self.tch_feats.clear()
         has_input_signal = input_signal is not None and input_signal_length is not None
@@ -462,7 +470,22 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
         )
         
         # logit distillation loss
-        if self.use_logit_distillation:
+        # if self.use_logit_distillation:
+        #     with torch.no_grad():
+        #         tch_log_probs, tch_encoded_len, tch_logits = self.teacher.forward(
+        #             input_signal=signal,
+        #             input_signal_length=signal_length,
+        #         )
+        #     T = self.temperature
+        #     stu_logp = F.log_softmax(log_probs / T, dim=-1)
+        #     tch_p    = F.softmax(tch_log_probs  / T, dim=-1)
+        #     logit_kd_loss  = F.kl_div(stu_logp, tch_p, reduction="batchmean") * (T*T)
+        #     self.log("train_kd_loss", logit_kd_loss, prog_bar=False, on_step=True, on_epoch=True)
+        # else:
+        #     logit_kd_loss = torch.tensor(0.0, device=log_probs.device)
+        # ---- (수정) logit distillation: baseline이면 10epoch까지만 ON ----
+        kd_on = self._is_kd_active()
+        if kd_on:
             with torch.no_grad():
                 tch_log_probs, tch_encoded_len, tch_logits = self.teacher.forward(
                     input_signal=signal,
@@ -501,6 +524,7 @@ class DistilEncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
 
 
         # logging
+        self.log("kd_active", float(kd_on), prog_bar=True, on_step=True, on_epoch=True)  # 1.0(ON)/0.0(OFF) 표시
         self.log("train_loss",     loss,     prog_bar=True, on_step=True, on_epoch=True)
         self.log("train_ctc_loss", ctc_loss, prog_bar=False, on_step=True, on_epoch=True)
         return loss
